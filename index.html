@@ -4,7 +4,6 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Focus Flow - 專注統計系統</title>
-    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🍅</text></svg>">
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
     <!-- React & ReactDOM -->
@@ -49,13 +48,13 @@
         const firebaseConfig = typeof __firebase_config !== 'undefined'
             ? JSON.parse(__firebase_config)
             : {
-               apiKey: "AIzaSyA_iLrEGp9HD9Vw11rO8NV96lhsJdlLZRc",
-  authDomain: "focusflow-cf2be.firebaseapp.com",
-  projectId: "focusflow-cf2be",
-  storageBucket: "focusflow-cf2be.firebasestorage.app",
-  messagingSenderId: "155744823743",
-  appId: "1:155744823743:web:45566e04913b0b975d190a",
-  measurementId: "G-XK9XD3NEPG"
+                apiKey: "AIzaSyA_iLrEGp9HD9Vw11rO8NV96lhsJdlLZRc",
+                authDomain: "focusflow-cf2be.firebaseapp.com",
+                projectId: "focusflow-cf2be",
+                storageBucket: "focusflow-cf2be.firebasestorage.app",
+                messagingSenderId: "155744823743",
+                appId: "1:155744823743:web:45566e04913b0b975d190a",
+                measurementId: "G-XK9XD3NEPG"
               };
 
         const app = initializeApp(firebaseConfig);
@@ -309,6 +308,7 @@
                         const fetchedTasks = [];
                         snapshot.forEach(doc => fetchedTasks.push({ id: doc.id, ...doc.data() }));
                         setTasks(fetchedTasks);
+                        localStorage.setItem('ff_tasks_morandi', JSON.stringify(fetchedTasks));
                     } else {
                         // First time sync default tasks
                         tasks.forEach(t => {
@@ -324,9 +324,27 @@
                 const unsubscribeRecords = onSnapshot(recordsColRef, (snapshot) => {
                     const fetchedRecords = [];
                     snapshot.forEach(doc => fetchedRecords.push({ id: doc.id, ...doc.data() }));
-                    if (fetchedRecords.length > 0) {
-                        setRecords(fetchedRecords);
-                    }
+
+                    // Read local records
+                    const localRecords = JSON.parse(localStorage.getItem('ff_records_morandi') || '[]');
+                    
+                    // Merge local and cloud records (deduplicate by record ID)
+                    const recordMap = new Map();
+                    localRecords.forEach(r => recordMap.set(r.id, r));
+                    fetchedRecords.forEach(r => recordMap.set(r.id, r));
+
+                    const mergedRecords = Array.from(recordMap.values());
+
+                    // Auto-upload local records that are not yet in Firestore
+                    localRecords.forEach(r => {
+                        if (!fetchedRecords.some(fr => fr.id === r.id)) {
+                            setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r)
+                                .catch(err => console.error("Error uploading local record to Firestore:", err));
+                        }
+                    });
+
+                    setRecords(mergedRecords);
+                    localStorage.setItem('ff_records_morandi', JSON.stringify(mergedRecords));
                 }, (error) => {
                     console.error("Firestore records sync error:", error);
                 });
