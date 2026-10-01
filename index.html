@@ -167,6 +167,19 @@
         input[type="range"] {
             accent-color: #B5BDB9;
         }
+        /* 解決手機拖拉裁切圖片時頁面跟著滾動的問題 */
+        .cropper-container, .cropper-bg {
+            touch-action: none !important;
+        }
+        /* 在手機螢幕下，將裁切預覽區域設為直向比例 (9:16) */
+        @media (max-width: 640px) {
+            .crop-preview-container {
+                aspect-ratio: 9 / 16 !important;
+                max-height: 60vh !important;
+                width: 100% !important;
+                margin: 0 auto;
+            }
+        }
     </style>
 </head>
 <body class="min-h-screen flex flex-col justify-between selection:bg-brand selection:text-morandi-900">
@@ -547,10 +560,11 @@
                 >
                     {/* Header Bar */}
                     <header class="flex flex-wrap justify-between items-center gap-4 mb-6 border-b border-morandi-700/60 pb-4">
-                        <div class="flex items-center space-x-3">
-                            <div class="w-10 h-10 rounded-2xl bg-[#B5BDB9] flex items-center justify-center text-morandi-900 font-bold text-xl shadow-lg">
-                                <i class="fa-solid fa-leaf"></i>
+                        <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50 p-4 sm:absolute sm:inset-auto sm:right-0 sm:top-full sm:mt-2 sm:w-80 sm:bg-transparent sm:p-0">
+                            <div class="w-full max-w-sm rounded-2xl border border-white/20 bg-slate-900/90 p-5 shadow-xl backdrop-blur-xl">
+                                <!-- 原本的視覺效果內容（不透明度、模糊滑桿等） -->
                             </div>
+                        </div>
                             <span class="text-xl md:text-2xl font-bold tracking-wide text-[#B5BDB9]">FocusFlow</span>
                         </div>
 
@@ -1091,7 +1105,9 @@
                             onMouseMove={handleMouseMove}
                             onMouseUp={handleMouseUp}
                             onMouseLeave={handleMouseUp}
-                            style={{ aspectRatio: '16/9' }}
+                            style={{ aspectRatio: window.innerWidth < 640 ? 9 / 16 : 16 / 9,
+                                    responsive: true,
+                                    restore: true, }}
                         >
                             <canvas ref={canvasRef} class="w-full h-full object-contain"></canvas>
 
