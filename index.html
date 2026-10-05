@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="zh-TW">
+<html lang="zh-TW" class="overflow-x-hidden">
 <head>
     <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🍅</text></svg>">
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
     <title>Focus Flow - 專注統計系統</title>
     <!-- Tailwind CSS -->
     <script src="https://cdn.tailwindcss.com"></script>
@@ -33,7 +33,9 @@
             createUserWithEmailAndPassword, 
             signInWithEmailAndPassword, 
             signOut, 
-            onAuthStateChanged 
+            onAuthStateChanged,
+            setPersistence,
+            browserLocalPersistence
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-auth.js";
         import { 
             getFirestore, 
@@ -41,13 +43,13 @@
             setDoc, 
             getDoc, 
             collection, 
-            onSnapshot 
+            onSnapshot,
+            query,
+            orderBy
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Global Firebase Environment & Config
-        // 固定 App ID，確保不同裝置永遠使用同一個 Firestore 路徑
-        // 不使用可能因執行環境不同而改變的 __app_id。
-        const appId = 'focus-flow-app';
+        const appId = typeof __app_id !== 'undefined' ? __app_id : 'focus-flow-app';
         const firebaseConfig = typeof __firebase_config !== 'undefined'
             ? JSON.parse(__firebase_config)
             : {
@@ -64,11 +66,21 @@
         const auth = getAuth(app);
         const db = getFirestore(app);
 
-        // Initial Auth Setup (Custom token or fallback to anonymous if needed)
+        // Ensure persistence across tabs/devices
+        setPersistence(auth, browserLocalPersistence).catch(err => {
+            console.warn('Auth persistence notice:', err);
+        });
+
+        // Initial Auth Setup
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
         if (initialAuthToken) {
             signInWithCustomToken(auth, initialAuthToken).catch(err => {
                 console.warn('Initial token signin fallback:', err);
+                signInAnonymously(auth).catch(aErr => console.warn('Anonymous auth fallback:', aErr));
+            });
+        } else if (!auth.currentUser) {
+            signInAnonymously(auth).catch(err => {
+                console.warn('Anonymous auto sign-in notice:', err);
             });
         }
 
@@ -78,6 +90,7 @@
             firebaseConfig,
             auth,
             db,
+            signInAnonymously,
             GoogleAuthProvider,
             signInWithPopup,
             createUserWithEmailAndPassword,
@@ -88,7 +101,8 @@
             setDoc,
             getDoc,
             collection,
-            onSnapshot
+            onSnapshot,
+            query
         };
     </script>
 
@@ -121,11 +135,9 @@
     </script>
     <style>
         html, body {
-            width: 100%;
-            max-width: 100%;
             overflow-x: hidden;
+            width: 100%;
         }
-
         body {
             font-family: 'Zen Maru Gothic', sans-serif;
             background-color: #182420;
@@ -171,13 +183,12 @@
                 box-shadow: 0 0 0 0 rgba(181, 189, 185, 0);
             }
         }
-        /* Range slider styling */
         input[type="range"] {
             accent-color: #B5BDB9;
         }
     </style>
 </head>
-<body class="min-h-screen flex flex-col justify-between selection:bg-brand selection:text-morandi-900">
+<body class="min-h-screen flex flex-col justify-between selection:bg-brand selection:text-morandi-900 overflow-x-hidden">
     <div id="root" class="w-full flex-grow flex flex-col"></div>
 
     <script type="text/babel">
@@ -243,8 +254,8 @@
             // Auth States
             const [user, setUser] = React.useState(null);
             const [isAuthModalOpen, setIsAuthModalOpen] = React.useState(false);
-            const [authNotice, setAuthNotice] = React.useState('');
-            const [syncError, setSyncError] = React.useState('');
+            const [isSyncing, setIsSyncing] = React.useState(false);
+            const [cloudSyncError, setCloudSyncError] = React.useState(false);
 
             // Timer States
             const [mode, setMode] = React.useState('focus');
@@ -282,7 +293,7 @@
             const [cropModalOpen, setCropModalOpen] = React.useState(false);
             const [rawImageSrc, setRawImageSrc] = React.useState('');
 
-            // Tasks & Records
+            // Tasks & Records State
             const [tasks, setTasks] = React.useState(() => {
                 const saved = localStorage.getItem('ff_tasks_morandi');
                 return saved ? JSON.parse(saved) : DEFAULT_TASKS;
@@ -302,115 +313,74 @@
                 const { auth, onAuthStateChanged } = window.FirebaseServices;
                 const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
                     setUser(currentUser);
+                    setCloudSyncError(false); // Reset permission error state on user login state change
                 });
                 return () => unsubscribe();
             }, []);
 
-            // Firestore Synchronization for User Data
             React.useEffect(() => {
                 if (!user || !window.FirebaseServices) return;
+                const { db, collection, onSnapshot, doc, setDoc } = window.FirebaseServices;
+                setIsSyncing(true);
 
-                const { db, appId, collection, onSnapshot, doc, setDoc } = window.FirebaseServices;
-                let cancelled = false;
-                setSyncError('');
-
-                // 所有裝置都使用同一個固定路徑：
-                // /artifacts/focus-flow-app/users/{Google UID}/...
-                const userRoot = ['artifacts', appId, 'users', user.uid];
-
-                const tasksColRef = collection(db, ...userRoot, 'tasks');
-                const recordsColRef = collection(db, ...userRoot, 'records');
-
-                // Tasks 同步
-                const unsubscribeTasks = onSnapshot(
-                    tasksColRef,
-                    async (snapshot) => {
-                        if (cancelled) return;
-
-                        if (!snapshot.empty) {
-                            const fetchedTasks = [];
-                            snapshot.forEach(taskDoc => {
-                                fetchedTasks.push({ id: taskDoc.id, ...taskDoc.data() });
+                // Unified user collection path for seamless cross-device synchronization
+                const tasksColRef = collection(db, 'users', user.uid, 'tasks');
+                const unsubscribeTasks = onSnapshot(tasksColRef, (snapshot) => {
+                    if (!snapshot.empty) {
+                        const fetchedTasks = [];
+                        snapshot.forEach(doc => fetchedTasks.push({ id: doc.id, ...doc.data() }));
+                        setTasks(fetchedTasks);
+                        localStorage.setItem('ff_tasks_morandi', JSON.stringify(fetchedTasks));
+                    } else {
+                        // First time initializing user tasks in cloud
+                        tasks.forEach(t => {
+                            setDoc(doc(db, 'users', user.uid, 'tasks', t.id), t).catch(err => {
+                                console.warn('Task sync setDoc warning:', err.message);
                             });
-                            setTasks(fetchedTasks);
-                            localStorage.setItem('ff_tasks_morandi', JSON.stringify(fetchedTasks));
-                        } else {
-                            // 雲端第一次使用：把目前裝置的任務上傳一次
-                            const localTasks = JSON.parse(
-                                localStorage.getItem('ff_tasks_morandi') || 'null'
-                            ) || DEFAULT_TASKS;
+                        });
+                    }
+                    setIsSyncing(false);
+                    setCloudSyncError(false);
+                }, (error) => {
+                    console.warn("Firestore tasks sync fallback to local:", error.message);
+                    setIsSyncing(false);
+                    setCloudSyncError(true);
+                });
 
-                            await Promise.all(
-                                localTasks.map(t =>
-                                    setDoc(doc(db, ...userRoot, 'tasks', t.id), t)
-                                )
-                            ).catch(err => {
-                                console.error('Error uploading initial tasks:', err);
-                                setSyncError('雲端任務同步失敗，請檢查 Firestore 權限');
+                // User records cloud path
+                const recordsColRef = collection(db, 'users', user.uid, 'records');
+                const unsubscribeRecords = onSnapshot(recordsColRef, (snapshot) => {
+                    const fetchedRecords = [];
+                    snapshot.forEach(doc => fetchedRecords.push({ id: doc.id, ...doc.data() }));
+
+                    const localRecords = JSON.parse(localStorage.getItem('ff_records_morandi') || '[]');
+                    
+                    // Merge local & cloud records (deduplicate by record ID)
+                    const recordMap = new Map();
+                    fetchedRecords.forEach(r => recordMap.set(r.id, r));
+                    localRecords.forEach(r => {
+                        if (!recordMap.has(r.id)) {
+                            recordMap.set(r.id, r);
+                            // Upload local-only record to cloud
+                            setDoc(doc(db, 'users', user.uid, 'records', r.id), r).catch(err => {
+                                console.warn('Record upload warning:', err.message);
                             });
                         }
-                    },
-                    (error) => {
-                        console.error('Firestore tasks sync error:', error);
-                        setSyncError('Firestore 無法讀取資料：' + (error.code || error.message));
-                    }
-                );
+                    });
 
-                // Records 同步
-                const unsubscribeRecords = onSnapshot(
-                    recordsColRef,
-                    async (snapshot) => {
-                        if (cancelled) return;
+                    const mergedRecords = Array.from(recordMap.values()).sort((a, b) => b.timestamp - a.timestamp);
 
-                        const cloudRecords = [];
-                        snapshot.forEach(recordDoc => {
-                            cloudRecords.push({ id: recordDoc.id, ...recordDoc.data() });
-                        });
-
-                        const localRecords = JSON.parse(
-                            localStorage.getItem('ff_records_morandi') || '[]'
-                        );
-
-                        // 雲端資料 + 本機尚未上傳的資料合併
-                        const recordMap = new Map();
-                        cloudRecords.forEach(r => recordMap.set(String(r.id), r));
-                        localRecords.forEach(r => {
-                            if (!recordMap.has(String(r.id))) {
-                                recordMap.set(String(r.id), r);
-                            }
-                        });
-
-                        const mergedRecords = Array.from(recordMap.values());
-
-                        // 把本機沒有出現在雲端的舊紀錄補上傳
-                        const cloudIds = new Set(cloudRecords.map(r => String(r.id)));
-                        const pendingUploads = localRecords
-                            .filter(r => !cloudIds.has(String(r.id)))
-                            .map(r =>
-                                setDoc(doc(db, ...userRoot, 'records', String(r.id)), r)
-                            );
-
-                        try {
-                            await Promise.all(pendingUploads);
-                        } catch (err) {
-                            console.error('Error uploading local records:', err);
-                            setSyncError('部分本機紀錄尚未成功上傳雲端');
-                        }
-
-                        setRecords(mergedRecords);
-                        localStorage.setItem(
-                            'ff_records_morandi',
-                            JSON.stringify(mergedRecords)
-                        );
-                    },
-                    (error) => {
-                        console.error('Firestore records sync error:', error);
-                        setSyncError('Firestore 無法讀取專注紀錄：' + (error.code || error.message));
-                    }
-                );
+                    setRecords(mergedRecords);
+                    localStorage.setItem('ff_records_morandi', JSON.stringify(mergedRecords));
+                    setIsSyncing(false);
+                    setCloudSyncError(false);
+                }, (error) => {
+                    console.warn("Firestore records sync fallback to local:", error.message);
+                    setIsSyncing(false);
+                    setCloudSyncError(true);
+                });
 
                 return () => {
-                    cancelled = true;
                     unsubscribeTasks();
                     unsubscribeRecords();
                 };
@@ -420,10 +390,16 @@
             const updateTasksWithSync = (newTasks) => {
                 setTasks(newTasks);
                 localStorage.setItem('ff_tasks_morandi', JSON.stringify(newTasks));
-                if (user && window.FirebaseServices) {
-                    const { db, appId, doc, setDoc } = window.FirebaseServices;
+                if (user && window.FirebaseServices && !cloudSyncError) {
+                    const { db, doc, setDoc } = window.FirebaseServices;
                     newTasks.forEach(t => {
-                        setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'tasks', t.id), t).catch(err => console.error(err));
+                        setDoc(doc(db, 'users', user.uid, 'tasks', t.id), t).catch(err => {
+                            if (err.code === 'permission-denied' || err.message?.includes('permissions')) {
+                                setCloudSyncError(true);
+                            } else {
+                                console.warn('Firestore task write notice:', err);
+                            }
+                        });
                     });
                 }
             };
@@ -431,20 +407,22 @@
             // Save Records changes to Firestore & LocalStorage
             const updateRecordsWithSync = (newRecord) => {
                 setRecords(prev => {
-                    const updated = [...prev, newRecord];
+                    const updated = [newRecord, ...prev];
                     localStorage.setItem('ff_records_morandi', JSON.stringify(updated));
                     return updated;
                 });
 
-                if (user && window.FirebaseServices) {
-                    const { db, appId, doc, setDoc } = window.FirebaseServices;
-                    setDoc(
-                        doc(db, 'artifacts', appId, 'users', user.uid, 'records', String(newRecord.id)),
-                        newRecord
-                    ).catch(err => {
-                        console.error('Error saving record to Firestore:', err);
-                        setSyncError('這筆紀錄尚未成功同步到雲端：' + (err.code || err.message));
-                    });
+                if (user && window.FirebaseServices && !cloudSyncError) {
+                    const { db, doc, setDoc } = window.FirebaseServices;
+                    setDoc(doc(db, 'users', user.uid, 'records', newRecord.id), newRecord)
+                        .then(() => console.log('Record synced to cloud'))
+                        .catch(err => {
+                            if (err.code === 'permission-denied' || err.message?.includes('permissions')) {
+                                setCloudSyncError(true);
+                            } else {
+                                console.warn('Cloud record write notice:', err);
+                            }
+                        });
                 }
             };
 
@@ -497,8 +475,6 @@
                 if (!isRunning) {
                     if (timerType === 'pomodoro') {
                         setSeconds(modeDurations[mode] || 25 * 60);
-                    } else {
-                        setElapsedStopwatch(0);
                     }
                 }
             }, [mode, timerType, modeDurations]);
@@ -526,14 +502,16 @@
                 return () => clearInterval(timer);
             }, [isRunning, timerType, mode, seconds]);
 
+            // Handle completed timer session or stopwatch pause & save
             const handleSessionComplete = () => {
                 setIsRunning(false);
                 playBeep('finish');
                 
                 const duration = timerType === 'pomodoro' ? modeDurations[mode] : elapsedStopwatch;
+                
                 if (duration > 0) {
                     const newRecord = {
-                        id: Date.now().toString(),
+                        id: `rec_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
                         taskId: selectedTaskId,
                         mode: mode,
                         durationSeconds: duration,
@@ -546,11 +524,17 @@
                         setSessionCount(prev => prev + 1);
                     }
                 }
+
+                // FIXED ISSUE #3: When Stopwatch (正計時) finishes/pauses, reset elapsed time to zero
+                if (timerType === 'stopwatch') {
+                    setElapsedStopwatch(0);
+                }
             };
 
             const toggleTimer = () => {
                 playBeep('click');
                 if (isRunning && timerType === 'stopwatch') {
+                    // Clicking "暫停並儲存" in stopwatch mode triggers completion & reset
                     handleSessionComplete();
                 } else {
                     setIsRunning(!isRunning);
@@ -594,8 +578,8 @@
                         };
                         mockRecords.push(r);
                         if (user && window.FirebaseServices) {
-                            const { db, appId, doc, setDoc } = window.FirebaseServices;
-                            setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r);
+                            const { db, doc, setDoc } = window.FirebaseServices;
+                            setDoc(doc(db, 'users', user.uid, 'records', r.id), r);
                         }
                     }
                 }
@@ -609,88 +593,111 @@
                         backdropFilter: bgBlur > 0 ? `blur(${bgBlur}px)` : 'none',
                         WebkitBackdropFilter: bgBlur > 0 ? `blur(${bgBlur}px)` : 'none'
                     }}
-                    class="flex-grow flex flex-col justify-between max-w-6xl mx-auto w-full min-w-0 px-3 sm:px-4 py-4 md:py-6 my-0 md:my-4 rounded-3xl shadow-2xl border border-morandi-700/40 transition-all duration-200"
+                    class="flex-grow flex flex-col justify-between max-w-6xl mx-auto w-full px-3 sm:px-5 py-4 md:py-6 my-0 md:my-4 rounded-2xl md:rounded-3xl shadow-2xl border border-morandi-700/40 transition-all duration-200 overflow-x-hidden"
                 >
-                    {/* Header Bar */}
-                    <header class="flex flex-wrap justify-between items-center gap-3 mb-6 border-b border-morandi-700/60 pb-4 min-w-0">
-                        <div class="flex items-center space-x-3">
-                            <div class="w-10 h-10 rounded-2xl bg-[#B5BDB9] flex items-center justify-center text-morandi-900 font-bold text-xl shadow-lg">
-                                <i class="fa-solid fa-leaf"></i>
+                    {/* Header Bar - Fully Responsive for Mobile */}
+                    <header class="flex flex-col md:flex-row justify-between items-center gap-3 mb-4 md:mb-6 border-b border-morandi-700/60 pb-3 md:pb-4 w-full">
+                        <div class="flex items-center justify-between w-full md:w-auto">
+                            <div class="flex items-center space-x-2.5">
+                                <div class="w-9 h-9 md:w-10 md:h-10 rounded-2xl bg-[#B5BDB9] flex items-center justify-center text-morandi-900 font-bold text-lg md:text-xl shadow-lg shrink-0">
+                                    <i class="fa-solid fa-leaf"></i>
+                                </div>
+                                <span class="text-lg md:text-2xl font-bold tracking-wide text-[#B5BDB9]">FocusFlow</span>
                             </div>
-                            <span class="text-xl md:text-2xl font-bold tracking-wide text-[#B5BDB9]">FocusFlow</span>
+
+                            {/* Mobile user badge quick action */}
+                            <button
+                                onClick={() => setIsAuthModalOpen(true)}
+                                class="md:hidden text-xs px-2.5 py-1.5 rounded-xl border border-morandi-600/80 bg-morandi-800/80 text-morandi-200 flex items-center space-x-1"
+                            >
+                                <i class={`fa-solid ${cloudSyncError ? 'fa-hard-drive text-amber-400' : (user ? 'fa-cloud-check text-emerald-400' : 'fa-user-lock')}`}></i>
+                                <span class="truncate max-w-[90px]">{cloudSyncError ? '本機模式' : (user ? (user.email ? user.email.split('@')[0] : '已同步') : '登入')}</span>
+                            </button>
                         </div>
 
-                        {/* Top Nav Tabs */}
-                        <nav class="flex items-center max-w-full overflow-x-auto bg-morandi-900/80 p-1.5 rounded-2xl border border-morandi-700/60">
+                        {/* Navigation Tabs - Compact Responsive */}
+                        <nav class="flex items-center justify-center w-full md:w-auto bg-morandi-900/80 p-1 md:p-1.5 rounded-2xl border border-morandi-700/60">
                             <button
                                 onClick={() => { playBeep('click'); setCurrentTab('timer'); }}
-                                class={`flex items-center space-x-2 px-4 py-2 rounded-xl text-sm md:text-base font-medium transition-all ${
+                                class={`flex-1 md:flex-initial flex items-center justify-center space-x-1.5 px-3 md:px-4 py-1.5 md:py-2 rounded-xl text-xs md:text-base font-medium transition-all ${
                                     currentTab === 'timer'
                                         ? 'bg-[#B5BDB9] text-morandi-900 font-bold shadow-md'
                                         : 'text-morandi-200 hover:text-white'
                                 }`}
                             >
-                                <i class="fa-solid fa-stopwatch"></i>
+                                <i class="fa-solid fa-stopwatch text-xs md:text-sm"></i>
                                 <span>計時器</span>
                             </button>
 
                             <button
                                 onClick={() => { playBeep('click'); setCurrentTab('stats'); }}
-                                class={`flex items-center space-x-2 px-4 py-2 rounded-xl text-sm md:text-base font-medium transition-all ${
+                                class={`flex-1 md:flex-initial flex items-center justify-center space-x-1.5 px-3 md:px-4 py-1.5 md:py-2 rounded-xl text-xs md:text-base font-medium transition-all ${
                                     currentTab === 'stats'
                                         ? 'bg-[#B5BDB9] text-morandi-900 font-bold shadow-md'
                                         : 'text-morandi-200 hover:text-white'
                                 }`}
                             >
-                                <i class="fa-solid fa-chart-pie"></i>
+                                <i class="fa-solid fa-chart-pie text-xs md:text-sm"></i>
                                 <span>統計分析</span>
                             </button>
 
                             <button
                                 onClick={() => { playBeep('click'); setCurrentTab('tasks'); }}
-                                class={`flex items-center space-x-2 px-4 py-2 rounded-xl text-sm md:text-base font-medium transition-all ${
+                                class={`flex-1 md:flex-initial flex items-center justify-center space-x-1.5 px-3 md:px-4 py-1.5 md:py-2 rounded-xl text-xs md:text-base font-medium transition-all ${
                                     currentTab === 'tasks'
                                         ? 'bg-[#B5BDB9] text-morandi-900 font-bold shadow-md'
                                         : 'text-morandi-200 hover:text-white'
                                 }`}
                             >
-                                <i class="fa-solid fa-list-check"></i>
+                                <i class="fa-solid fa-list-check text-xs md:text-sm"></i>
                                 <span>待辦項目</span>
                             </button>
                         </nav>
 
-                        {}
-                        {/* Header Actions: Auth Login & Visual Controls */}
-                        <div class="flex flex-wrap items-center justify-end gap-2 max-w-full">
+                        {/* Top Header Controls (Desktop & Mobile Wrapped) */}
+                        <div class="flex items-center justify-end flex-wrap gap-1.5 md:gap-2 w-full md:w-auto">
                             {/* User Auth Button */}
                             <button
                                 onClick={() => setIsAuthModalOpen(true)}
-                                class={`px-3 py-2 rounded-xl text-xs font-semibold flex items-center space-x-1.5 border transition-all shadow-sm ${
-                                    user 
-                                        ? 'bg-emerald-900/60 border-emerald-500/60 text-emerald-200 hover:bg-emerald-800/80' 
-                                        : 'bg-morandi-800/90 border-[#B5BDB9]/40 text-[#B5BDB9] hover:bg-morandi-700'
+                                class={`hidden md:flex px-3 py-2 rounded-xl text-xs font-semibold items-center space-x-1.5 border transition-all shadow-sm ${
+                                    cloudSyncError
+                                        ? 'bg-amber-900/40 border-amber-500/50 text-amber-200 hover:bg-amber-800/60'
+                                        : user 
+                                            ? 'bg-emerald-900/60 border-emerald-500/60 text-emerald-200 hover:bg-emerald-800/80' 
+                                            : 'bg-morandi-800/90 border-[#B5BDB9]/40 text-[#B5BDB9] hover:bg-morandi-700'
                                 }`}
                             >
-                                <i class={`fa-solid ${user ? 'fa-cloud-check' : 'fa-user-lock'}`}></i>
-                                <span>{user ? (user.email ? user.email.split('@')[0] : '已雲端同步') : '帳號登入 / 同步'}</span>
+                                <i class={`fa-solid ${cloudSyncError ? 'fa-hard-drive text-amber-400' : (user ? 'fa-cloud-check text-emerald-400' : 'fa-user-lock')}`}></i>
+                                <span class="max-w-[130px] truncate">
+                                    {cloudSyncError 
+                                        ? '本機儲存 (請登入)' 
+                                        : user ? (user.email ? user.email.split('@')[0] : '已雲端同步') : '帳號登入 / 同步'}
+                                </span>
                             </button>
 
-                            {/* Transparency & Blur Controls */}
-                            <div class="relative">
+                            {/* FIXED ISSUE #1: Transparency & Visual Controls Popover constrained on Mobile */}
+                            <div class="relative shrink-0">
                                 <button
                                     onClick={() => setShowOpacitySlider(!showOpacitySlider)}
                                     title="調整視覺與模糊度"
-                                    class={`bg-morandi-800/90 hover:bg-morandi-700 text-[#B5BDB9] border border-[#B5BDB9]/40 px-3 py-2 rounded-xl text-xs font-semibold flex items-center space-x-1.5 transition-all shadow-sm ${showOpacitySlider ? 'ring-2 ring-[#B5BDB9]' : ''}`}
+                                    class={`bg-morandi-800/90 hover:bg-morandi-700 text-[#B5BDB9] border border-[#B5BDB9]/40 px-2.5 py-1.5 md:px-3 md:py-2 rounded-xl text-xs font-semibold flex items-center space-x-1 md:space-x-1.5 transition-all shadow-sm ${showOpacitySlider ? 'ring-2 ring-[#B5BDB9]' : ''}`}
                                 >
                                     <i class="fa-solid fa-sliders"></i>
                                     <span>視覺效果</span>
                                 </button>
 
                                 {showOpacitySlider && (
-                                    <div class="absolute top-12 right-0 bg-morandi-900 border border-morandi-600 p-4 rounded-2xl shadow-2xl z-30 w-60 max-w-[calc(100vw-2rem)] flex flex-col space-y-4">
+                                    <div class="fixed md:absolute top-16 md:top-12 right-2 md:right-0 left-2 md:left-auto bg-morandi-900 border border-morandi-600 p-4 rounded-2xl shadow-2xl z-50 w-auto md:w-64 max-w-[calc(100vw-1rem)] flex flex-col space-y-4">
+                                        <div class="flex justify-between items-center border-b border-morandi-700 pb-2">
+                                            <span class="text-xs font-bold text-[#B5BDB9]">🎨 視覺不透明度與模糊</span>
+                                            <button onClick={() => setShowOpacitySlider(false)} class="text-morandi-300 hover:text-white">
+                                                <i class="fa-solid fa-xmark text-xs"></i>
+                                            </button>
+                                        </div>
+
                                         <div class="flex flex-col space-y-1">
                                             <div class="flex justify-between text-xs text-morandi-200 font-medium">
-                                                <span>不透明度</span>
+                                                <span>背景不透明度</span>
                                                 <span class="font-mono text-[#B5BDB9]">{Math.round(bgOpacity * 100)}%</span>
                                             </div>
                                             <input
@@ -702,13 +709,9 @@
                                                 onChange={(e) => setBgOpacity(parseFloat(e.target.value))}
                                                 class="w-full cursor-pointer h-2 bg-morandi-700 rounded-lg appearance-none"
                                             />
-                                            <div class="flex justify-between text-[10px] text-morandi-300">
-                                                <span>完全透明</span>
-                                                <span>不透明</span>
-                                            </div>
                                         </div>
 
-                                        <div class="flex flex-col space-y-1 pt-2 border-t border-morandi-700/60">
+                                        <div class="flex flex-col space-y-1 pt-1 border-t border-morandi-700/60">
                                             <div class="flex justify-between items-center text-xs text-morandi-200 font-medium">
                                                 <span>模糊效果 (Blur)</span>
                                                 <span class="font-mono text-[#B5BDB9]">{bgBlur}px</span>
@@ -722,21 +725,17 @@
                                                 onChange={(e) => setBgBlur(parseInt(e.target.value, 10))}
                                                 class="w-full cursor-pointer h-2 bg-morandi-700 rounded-lg appearance-none"
                                             />
-                                            <div class="flex justify-between text-[10px] text-morandi-300">
-                                                <span>無模糊</span>
-                                                <span>高模糊 (20px)</span>
-                                            </div>
                                         </div>
 
                                         <div class="grid grid-cols-2 gap-2 pt-1 border-t border-morandi-700/60">
                                             <button
-                                                onClick={() => { setBgOpacity(0.15); setBgBlur(0); }}
+                                                onClick={() => { setBgOpacity(0.15); setBgBlur(0); setShowOpacitySlider(false); }}
                                                 class="py-1.5 bg-morandi-800 hover:bg-morandi-700 text-[11px] font-semibold text-morandi-200 rounded-lg border border-morandi-600 transition-all text-center"
                                             >
                                                 ✨ 極致透光
                                             </button>
                                             <button
-                                                onClick={() => { setBgOpacity(0.78); setBgBlur(8); }}
+                                                onClick={() => { setBgOpacity(0.78); setBgBlur(8); setShowOpacitySlider(false); }}
                                                 class="py-1.5 bg-morandi-800 hover:bg-morandi-700 text-[11px] font-semibold text-morandi-200 rounded-lg border border-morandi-600 transition-all text-center"
                                             >
                                                 🌫️ 經典毛玻璃
@@ -747,7 +746,7 @@
                             </div>
 
                             {/* Background Upload Button */}
-                            <label class="cursor-pointer bg-morandi-800/90 hover:bg-morandi-700 text-[#B5BDB9] border border-[#B5BDB9]/40 px-3 py-2 rounded-xl text-xs font-semibold flex items-center space-x-1.5 transition-all shadow-sm">
+                            <label class="cursor-pointer bg-morandi-800/90 hover:bg-morandi-700 text-[#B5BDB9] border border-[#B5BDB9]/40 px-2.5 py-1.5 md:px-3 md:py-2 rounded-xl text-xs font-semibold flex items-center space-x-1 md:space-x-1.5 transition-all shadow-sm shrink-0">
                                 <i class="fa-solid fa-image"></i>
                                 <span>{bgImage ? '更換背景' : '自訂背景'}</span>
                                 <input type="file" accept="image/*" onChange={handleFileSelect} class="hidden" />
@@ -757,7 +756,7 @@
                                 <button
                                     onClick={clearBgImage}
                                     title="重置背景"
-                                    class="p-2 text-morandi-300 hover:text-rose-300 text-xs transition-colors"
+                                    class="p-1.5 text-morandi-300 hover:text-rose-300 text-xs transition-colors shrink-0"
                                 >
                                     <i class="fa-solid fa-trash-can"></i>
                                 </button>
@@ -766,13 +765,7 @@
                     </header>
 
                     {/* Main Content Area */}
-                    <main class="flex-grow flex flex-col justify-center">
-                        {syncError && (
-                            <div class="mb-4 mx-auto w-full max-w-3xl bg-rose-900/60 border border-rose-500/70 text-rose-200 text-xs p-3 rounded-xl break-words">
-                                <i class="fa-solid fa-triangle-exclamation mr-2"></i>
-                                {syncError}
-                            </div>
-                        )}
+                    <main class="flex-grow flex flex-col justify-center w-full">
                         {currentTab === 'timer' && (
                             <TimerView
                                 mode={mode}
@@ -818,6 +811,8 @@
                     {isAuthModalOpen && (
                         <AuthModal
                             user={user}
+                            isSyncing={isSyncing}
+                            cloudSyncError={cloudSyncError}
                             onClose={() => setIsAuthModalOpen(false)}
                         />
                     )}
@@ -852,7 +847,7 @@
             );
         }
 
-        function AuthModal({ user, onClose }) {
+        function AuthModal({ user, isSyncing, cloudSyncError, onClose }) {
             const [isRegisterMode, setIsRegisterMode] = React.useState(false);
             const [email, setEmail] = React.useState('');
             const [password, setPassword] = React.useState('');
@@ -860,36 +855,23 @@
             const [successMsg, setSuccessMsg] = React.useState('');
             const [isLoading, setIsLoading] = React.useState(false);
 
-            const checkDemoConfig = () => {
-                if (window.FirebaseServices?.firebaseConfig?.apiKey?.includes('DemoConfigKey')) {
-                    setErrorMsg('💡 目前為本機開啟模式（file://）。Google 與 Email 雲端同步需設置真實 Firebase API Key。別擔心！您的所有計時與紀錄已自動儲存在此瀏覽器本機中，可直接正常使用！');
-                    return true;
-                }
-                return false;
-            };
-
             const handleGoogleLogin = async () => {
                 if (!window.FirebaseServices) return;
                 setIsLoading(true);
                 setErrorMsg('');
 
-                if (checkDemoConfig()) {
-                    setIsLoading(false);
-                    return;
-                }
-
                 try {
                     const { auth, GoogleAuthProvider, signInWithPopup } = window.FirebaseServices;
                     const provider = new GoogleAuthProvider();
+                    provider.setCustomParameters({ prompt: 'select_account' });
                     await signInWithPopup(auth, provider);
-                    setSuccessMsg('Google 帳號登入成功！數據已同步。');
+                    setSuccessMsg('Google 帳號登入成功！跨裝置數據正同步中...');
                     setTimeout(() => onClose(), 1200);
                 } catch (err) {
                     console.error('Google Sign-in Error:', err);
                     let readableErr = err.message;
-                    if (err.code === 'auth/api-key-not-valid') {
-                        readableErr = '💡 目前為本機開啟模式，未設定有效 Firebase API Key。本機數據已自動保存在您的瀏覽器中！';
-                    }
+                    if (err.code === 'auth/popup-closed-by-user') readableErr = '登入視窗已關閉';
+                    if (err.code === 'auth/popup-blocked') readableErr = '請允許瀏覽器彈出視窗以進行 Google 登入';
                     setErrorMsg(readableErr);
                 } finally {
                     setIsLoading(false);
@@ -908,28 +890,22 @@
                 setErrorMsg('');
                 setSuccessMsg('');
 
-                if (checkDemoConfig()) {
-                    setIsLoading(false);
-                    return;
-                }
-
                 try {
                     const { auth, signInWithEmailAndPassword, createUserWithEmailAndPassword } = window.FirebaseServices;
                     if (isRegisterMode) {
                         await createUserWithEmailAndPassword(auth, email, password);
-                        setSuccessMsg('帳號註冊成功並已自動登入！');
+                        setSuccessMsg('帳號註冊成功並已同步！');
                     } else {
                         await signInWithEmailAndPassword(auth, email, password);
-                        setSuccessMsg('登入成功！資料同步中...');
+                        setSuccessMsg('登入成功！跨裝置數據同步中...');
                     }
                     setTimeout(() => onClose(), 1200);
                 } catch (err) {
                     console.error('Email Auth Error:', err);
                     let readableErr = err.message;
-                    if (err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found') readableErr = 'Email 或密碼不正確';
-                    if (err.code === 'auth/email-already-in-use') readableErr = '此 Email 已被註冊';
+                    if (err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential') readableErr = 'Email 或密碼不正確';
+                    if (err.code === 'auth/email-already-in-use') readableErr = '此 Email 已被註冊，請直接登入';
                     if (err.code === 'auth/weak-password') readableErr = '密碼長度需至少 6 個字元';
-                    if (err.code === 'auth/api-key-not-valid') readableErr = '💡 本機模式下未設定 Firebase API Key，數據已自動保存在本機瀏覽器中！';
                     setErrorMsg(readableErr);
                 } finally {
                     setIsLoading(false);
@@ -949,44 +925,56 @@
             };
 
             return (
-                <div class="fixed inset-0 bg-black/70 backdrop-blur-md z-50 flex items-center justify-center p-4">
-                    <div class="bg-morandi-900 border border-morandi-600 w-full max-w-md rounded-3xl p-6 shadow-2xl relative flex flex-col space-y-4">
+                <div class="fixed inset-0 bg-black/70 backdrop-blur-md z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
+                    <div class="bg-morandi-900 border border-morandi-600 w-full max-w-md rounded-2xl sm:rounded-3xl p-5 sm:p-6 shadow-2xl relative flex flex-col space-y-4 my-auto">
                         <div class="flex justify-between items-center border-b border-morandi-700/80 pb-3">
-                            <h3 class="text-base font-bold text-[#B5BDB9] flex items-center space-x-2">
-                                <i class="fa-solid fa-cloud"></i>
+                            <h3 class="text-sm sm:text-base font-bold text-[#B5BDB9] flex items-center space-x-2">
+                                <i class="fa-solid fa-cloud text-emerald-400"></i>
                                 <span>跨裝置數據同步 (Google / Email)</span>
                             </h3>
-                            <button onClick={onClose} class="text-morandi-300 hover:text-white">
+                            <button onClick={onClose} class="text-morandi-300 hover:text-white p-1">
                                 <i class="fa-solid fa-xmark text-lg"></i>
                             </button>
                         </div>
 
                         {/* Error & Success Banners */}
+                        {cloudSyncError && (
+                            <div class="bg-amber-900/50 border border-amber-500/80 text-amber-200 text-xs p-3 rounded-xl flex items-center space-x-2">
+                                <i class="fa-solid fa-circle-info shrink-0 text-amber-300"></i>
+                                <span>雲端存取受限。請登入或註冊您的 Google/Email 帳號以啟用跨裝置數據同步。</span>
+                            </div>
+                        )}
                         {errorMsg && (
                             <div class="bg-rose-900/60 border border-rose-500/80 text-rose-200 text-xs p-3 rounded-xl flex items-center space-x-2">
-                                <i class="fa-solid fa-triangle-exclamation"></i>
+                                <i class="fa-solid fa-triangle-exclamation shrink-0"></i>
                                 <span>{errorMsg}</span>
                             </div>
                         )}
                         {successMsg && (
                             <div class="bg-emerald-900/60 border border-emerald-500/80 text-emerald-200 text-xs p-3 rounded-xl flex items-center space-x-2">
-                                <i class="fa-solid fa-circle-check"></i>
+                                <i class="fa-solid fa-circle-check shrink-0"></i>
                                 <span>{successMsg}</span>
                             </div>
                         )}
 
                         {user ? (
-                            /* Logged In View */
+                            /* Logged In Status Card */
                             <div class="space-y-4">
-                                <div class="bg-morandi-800/80 border border-morandi-700 p-4 rounded-2xl space-y-2">
-                                    <div class="text-xs text-morandi-300">目前登入狀態</div>
-                                    <div class="text-sm font-bold text-[#B5BDB9] flex items-center space-x-2">
-                                        <i class="fa-solid fa-circle-user text-emerald-400"></i>
-                                        <span>{user.email || '已驗證使用者'}</span>
+                                <div class="bg-morandi-800/80 border border-morandi-700 p-4 rounded-2xl space-y-3">
+                                    <div class="flex items-center justify-between">
+                                        <span class="text-xs text-morandi-300">雲端帳號綁定狀態</span>
+                                        <span class="text-[11px] px-2 py-0.5 rounded-full bg-emerald-900/80 text-emerald-300 border border-emerald-500/40 flex items-center space-x-1">
+                                            <span class="w-1.5 h-1.5 rounded-full bg-emerald-400 animate-pulse"></span>
+                                            <span>跨裝置即時同步中</span>
+                                        </span>
+                                    </div>
+                                    <div class="text-sm font-bold text-[#B5BDB9] flex items-center space-x-2 break-all">
+                                        <i class="fa-solid fa-circle-user text-emerald-400 text-lg shrink-0"></i>
+                                        <span>{user.email || user.displayName || 'Google 驗證使用者'}</span>
                                     </div>
                                     <div class="pt-2 border-t border-morandi-700/60 flex flex-col space-y-1">
-                                        <span class="text-[11px] text-morandi-300">使用者 ID (UID)：</span>
-                                        <span class="font-mono text-xs text-morandi-100 bg-morandi-900 p-2 rounded-xl break-all select-all border border-morandi-700">
+                                        <span class="text-[11px] text-morandi-300">使用者同步識別碼 (UID)：</span>
+                                        <span class="font-mono text-[11px] text-morandi-200 bg-morandi-900/90 p-2 rounded-xl break-all select-all border border-morandi-700">
                                             {user.uid}
                                         </span>
                                     </div>
@@ -1001,16 +989,20 @@
                                 </button>
                             </div>
                         ) : (
-                            /* Login / Register View */
+                            /* Login / Register Form */
                             <div class="space-y-4">
-                                {/* Google Auth Quick Button */}
+                                <p class="text-xs text-morandi-200 leading-relaxed">
+                                    登入後，您的專注紀錄與待辦清單將會在所有裝置（手機、電腦、平板）間自動保持同步。
+                                </p>
+
+                                {/* Google Auth Button */}
                                 <button
                                     onClick={handleGoogleLogin}
                                     disabled={isLoading}
                                     class="w-full py-3 bg-white hover:bg-slate-100 text-slate-800 font-bold text-xs rounded-xl transition-all shadow-md flex items-center justify-center space-x-2 border border-slate-300"
                                 >
                                     <i class="fa-brands fa-google text-red-500 text-base"></i>
-                                    <span>使用 Google 帳號快速登入</span>
+                                    <span>使用 Google 帳號跨裝置同步</span>
                                 </button>
 
                                 <div class="flex items-center my-2">
@@ -1102,13 +1094,11 @@
                 const ctx = canvas.getContext('2d');
                 const img = imgRef.current;
 
-                // Canvas dimensions (aspect ratio ~16:9 standard background)
                 canvas.width = 1280;
                 canvas.height = 720;
 
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
 
-                // Calculate scaled dimensions to cover canvas
                 const scale = Math.max(canvas.width / img.width, canvas.height / img.height) * zoom;
                 const width = img.width * scale;
                 const height = img.height * scale;
@@ -1145,10 +1135,10 @@
             };
 
             return (
-                <div class="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-4 overflow-y-auto">
-                    <div class="bg-morandi-900 border border-morandi-600 w-full max-w-3xl rounded-3xl p-6 shadow-2xl relative flex flex-col space-y-4">
+                <div class="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
+                    <div class="bg-morandi-900 border border-morandi-600 w-full max-w-3xl rounded-2xl sm:rounded-3xl p-4 sm:p-6 shadow-2xl relative flex flex-col space-y-4 my-auto">
                         <div class="flex justify-between items-center border-b border-morandi-700/80 pb-3">
-                            <h3 class="text-base font-bold text-[#B5BDB9] flex items-center space-x-2">
+                            <h3 class="text-sm sm:text-base font-bold text-[#B5BDB9] flex items-center space-x-2">
                                 <i class="fa-solid fa-crop text-[#B5BDB9]"></i>
                                 <span>背景圖片裁切與預覽</span>
                             </h3>
@@ -1167,7 +1157,6 @@
                         >
                             <canvas ref={canvasRef} class="w-full h-full object-contain"></canvas>
 
-                            {/* Simulated UI Overlay to preview text & buttons contrast */}
                             {isPreviewOverlay && (
                                 <div 
                                     style={{ 
@@ -1175,24 +1164,24 @@
                                         backdropFilter: currentBlur > 0 ? `blur(${currentBlur}px)` : 'none',
                                         WebkitBackdropFilter: currentBlur > 0 ? `blur(${currentBlur}px)` : 'none'
                                     }}
-                                    class="absolute inset-4 rounded-2xl border border-[#B5BDB9]/40 p-4 flex flex-col justify-between pointer-events-none transition-all"
+                                    class="absolute inset-3 sm:inset-4 rounded-2xl border border-[#B5BDB9]/40 p-3 sm:p-4 flex flex-col justify-between pointer-events-none transition-all"
                                 >
-                                    <div class="flex justify-between items-center text-xs text-[#B5BDB9] font-bold">
+                                    <div class="flex justify-between items-center text-[10px] sm:text-xs text-[#B5BDB9] font-bold">
                                         <span>🍃 FocusFlow (預覽視窗)</span>
-                                        <span class="bg-morandi-800/80 px-2 py-1 rounded-lg">透光度: {Math.round(currentOpacity * 100)}% | 模糊: {currentBlur}px</span>
+                                        <span class="bg-morandi-800/80 px-2 py-0.5 rounded-lg">透光: {Math.round(currentOpacity * 100)}% | 模糊: {currentBlur}px</span>
                                     </div>
                                     <div class="text-center">
-                                        <div class="text-4xl font-mono font-bold text-[#B5BDB9]">25:00</div>
+                                        <div class="text-2xl sm:text-4xl font-mono font-bold text-[#B5BDB9]">25:00</div>
                                     </div>
-                                    <div class="text-center text-[11px] text-morandi-300">
-                                        拖拽圖片以調整位置、使用下方拉桿縮放
+                                    <div class="text-center text-[10px] text-morandi-300">
+                                        拖拽圖片調整位置、使用下方拉桿縮放
                                     </div>
                                 </div>
                             )}
                         </div>
 
                         {/* Controls Bar */}
-                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-4 items-center bg-morandi-800/60 p-3 rounded-2xl border border-morandi-700/60">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 items-center bg-morandi-800/60 p-3 rounded-2xl border border-morandi-700/60">
                             {/* Zoom Slider */}
                             <div class="flex items-center space-x-3">
                                 <i class="fa-solid fa-magnifying-glass-minus text-xs text-morandi-300"></i>
@@ -1209,17 +1198,16 @@
                                 <span class="text-xs text-[#B5BDB9] font-mono shrink-0">{Math.round(zoom * 100)}%</span>
                             </div>
 
-                            {/* Preview Mode Switcher */}
-                            <div class="flex items-center justify-end space-x-3">
+                            <div class="flex items-center justify-end space-x-2">
                                 <button
                                     onClick={() => { setZoom(1); setPan({ x: 0, y: 0 }); }}
-                                    class="px-3 py-1.5 bg-morandi-700 hover:bg-morandi-600 text-xs text-morandi-200 rounded-xl transition-all"
+                                    class="px-2.5 py-1.5 bg-morandi-700 hover:bg-morandi-600 text-xs text-morandi-200 rounded-xl transition-all"
                                 >
                                     重置位置
                                 </button>
                                 <button
                                     onClick={() => setIsPreviewOverlay(!isPreviewOverlay)}
-                                    class={`px-3 py-1.5 text-xs rounded-xl font-semibold transition-all border ${
+                                    class={`px-2.5 py-1.5 text-xs rounded-xl font-semibold transition-all border ${
                                         isPreviewOverlay
                                             ? 'bg-[#B5BDB9] text-morandi-900 border-[#B5BDB9]'
                                             : 'bg-morandi-800 text-morandi-300 border-morandi-600'
@@ -1232,18 +1220,18 @@
                         </div>
 
                         {/* Action Buttons */}
-                        <div class="flex justify-end space-x-3 pt-2">
+                        <div class="flex justify-end space-x-2 pt-1">
                             <button
                                 type="button"
                                 onClick={onClose}
-                                class="px-5 py-2.5 bg-morandi-800 hover:bg-morandi-700 text-morandi-200 text-xs font-semibold rounded-xl"
+                                class="px-4 py-2 bg-morandi-800 hover:bg-morandi-700 text-morandi-200 text-xs font-semibold rounded-xl"
                             >
                                 取消
                             </button>
                             <button
                                 type="button"
                                 onClick={handleConfirm}
-                                class="px-6 py-2.5 bg-[#B5BDB9] hover:bg-white text-morandi-900 text-xs font-bold rounded-xl shadow-lg transition-all"
+                                class="px-5 py-2 bg-[#B5BDB9] hover:bg-white text-morandi-900 text-xs font-bold rounded-xl shadow-lg transition-all"
                             >
                                 套用此背景
                             </button>
@@ -1263,7 +1251,7 @@
         }) {
             const modes = [
                 { id: 'focus', name: '專注', badge: null, icon: 'fa-clock' },
-                { id: 'shortBreak', name: '短暫休息', badge: '休息 5分鐘', icon: 'fa-mug-hot' },
+                { id: 'shortBreak', name: '短暫休息', badge: '5分鐘', icon: 'fa-mug-hot' },
                 { id: 'longBreak', name: '長時間休息', badge: null, icon: 'fa-bed' }
             ];
 
@@ -1279,20 +1267,20 @@
             };
 
             return (
-                <div class="flex flex-col items-center justify-center py-4">
+                <div class="flex flex-col items-center justify-center py-2 sm:py-4 w-full">
                     {/* Top Mode Selector Tabs */}
-                    <div class="flex flex-wrap justify-center gap-2 md:gap-4 mb-8 bg-morandi-900/80 p-2 rounded-full border border-morandi-700/50">
+                    <div class="flex flex-wrap justify-center gap-1.5 sm:gap-3 mb-6 bg-morandi-900/80 p-1.5 sm:p-2 rounded-full border border-morandi-700/50 max-w-full">
                         {modes.map(m => (
                             <div key={m.id} class="relative">
                                 {m.badge && (
-                                    <div class="absolute -top-3 left-1/2 -translate-x-1/2 bg-[#B5BDB9] text-morandi-900 text-[10px] px-2 py-0.5 rounded-full font-bold shadow-sm whitespace-nowrap">
+                                    <div class="absolute -top-2.5 left-1/2 -translate-x-1/2 bg-[#B5BDB9] text-morandi-900 text-[9px] px-1.5 py-0.2 rounded-full font-bold shadow-sm whitespace-nowrap">
                                         {m.badge}
                                     </div>
                                 )}
                                 <button
                                     disabled={isRunning}
                                     onClick={() => setMode(m.id)}
-                                    class={`px-5 py-2.5 rounded-full text-sm font-medium transition-all flex items-center space-x-2 ${
+                                    class={`px-3.5 sm:px-5 py-2 rounded-full text-xs sm:text-sm font-medium transition-all flex items-center space-x-1.5 ${
                                         mode === m.id
                                             ? 'bg-morandi-600 text-[#B5BDB9] font-bold shadow-lg ring-2 ring-[#B5BDB9]/40'
                                             : 'text-morandi-200 hover:text-white hover:bg-morandi-700/40'
@@ -1306,12 +1294,12 @@
                     </div>
 
                     {/* Pomodoro vs Stopwatch Mode Switch */}
-                    <div class="flex items-center space-x-3 mb-6 bg-morandi-900/60 px-4 py-1.5 rounded-xl border border-morandi-700/40">
-                        <span class="text-xs text-morandi-300">模式：</span>
+                    <div class="flex items-center space-x-2 sm:space-x-3 mb-6 bg-morandi-900/60 px-3 py-1.5 rounded-xl border border-morandi-700/40 text-xs">
+                        <span class="text-morandi-300">模式：</span>
                         <button
                             disabled={isRunning}
                             onClick={() => setTimerType('pomodoro')}
-                            class={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                            class={`px-2.5 py-1 rounded-lg font-semibold transition-all ${
                                 timerType === 'pomodoro' ? 'bg-[#B5BDB9] text-morandi-900' : 'text-morandi-300 hover:text-white'
                             } ${isRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
                         >
@@ -1320,7 +1308,7 @@
                         <button
                             disabled={isRunning}
                             onClick={() => setTimerType('stopwatch')}
-                            class={`px-3 py-1 rounded-lg text-xs font-semibold transition-all ${
+                            class={`px-2.5 py-1 rounded-lg font-semibold transition-all ${
                                 timerType === 'stopwatch' ? 'bg-[#B5BDB9] text-morandi-900' : 'text-morandi-300 hover:text-white'
                             } ${isRunning ? 'opacity-50 cursor-not-allowed' : ''}`}
                         >
@@ -1329,24 +1317,24 @@
                     </div>
 
                     {/* Timer Clock Card */}
-                    <div class={`relative w-full max-w-lg min-w-0 bg-morandi-800/60 backdrop-blur-md rounded-3xl border border-morandi-600/60 p-5 sm:p-8 md:p-12 flex flex-col items-center shadow-2xl mb-8 transition-all ${
+                    <div class={`relative w-full max-w-lg bg-morandi-800/60 backdrop-blur-md rounded-2xl sm:rounded-3xl border border-morandi-600/60 p-6 sm:p-10 flex flex-col items-center shadow-2xl mb-6 transition-all ${
                         isRunning ? 'timer-running-pulse border-[#B5BDB9] bg-morandi-800/80' : ''
                     }`}>
                         {/* Status Tag */}
-                        <div class="absolute top-4 right-6 text-xs text-morandi-200 flex items-center space-x-1.5">
+                        <div class="absolute top-3 sm:top-4 right-4 sm:right-6 text-[11px] sm:text-xs text-morandi-200 flex items-center space-x-1.5">
                             <span class={`w-2 h-2 rounded-full ${isRunning ? 'bg-[#B5BDB9] animate-ping' : 'bg-morandi-400'}`}></span>
                             <span>{isRunning ? (timerType === 'pomodoro' ? '專注進行中...' : '正計時中...') : (timerType === 'pomodoro' ? '倒數模式' : '正計時模式')}</span>
                         </div>
 
                         {/* Display Time */}
-                        <div class="text-5xl sm:text-6xl md:text-8xl font-mono font-bold tracking-tight text-[#B5BDB9] my-4 drop-shadow-md select-none">
+                        <div class="text-5xl sm:text-7xl md:text-8xl font-mono font-bold tracking-tight text-[#B5BDB9] my-4 sm:my-6 drop-shadow-md select-none">
                             {timerType === 'pomodoro' ? formatDisplayTime(seconds) : formatDisplayTime(elapsedStopwatch)}
                         </div>
 
                         {/* Selected Task Dropdown */}
-                        <div class="w-full max-w-sm mt-4">
+                        <div class="w-full max-w-xs sm:max-w-sm mt-2">
                             <div class="flex items-center justify-between border-b border-[#B5BDB9]/40 pb-1.5 px-2">
-                                <div class="flex items-center space-x-2 text-morandi-200 text-sm flex-grow">
+                                <div class="flex items-center space-x-2 text-morandi-200 text-xs sm:text-sm flex-grow">
                                     <i class="fa-solid fa-pen-to-square text-[#B5BDB9]"></i>
                                     
                                     <select
@@ -1377,24 +1365,27 @@
                             </div>
                         </div>
 
-                        {/* Start / Pause Controls */}
-                        <div class="mt-10 flex items-center space-x-4">
+                        {/* FIXED ISSUE #3: Control Buttons with explicit "暫停並儲存" (Pause & Save & Reset to 0) for Stopwatch */}
+                        <div class="mt-8 sm:mt-10 flex items-center space-x-3 sm:space-x-4">
                             <button
                                 onClick={toggleTimer}
-                                class={`px-12 py-3.5 rounded-full border-2 text-xl md:text-2xl font-semibold tracking-wider transition-all transform active:scale-95 ${
+                                class={`px-8 sm:px-12 py-3 sm:py-3.5 rounded-full border-2 text-lg sm:text-2xl font-semibold tracking-wider transition-all transform active:scale-95 ${
                                     isRunning 
                                         ? 'bg-amber-700/90 hover:bg-amber-600 text-white border-amber-300' 
                                         : 'bg-morandi-600 text-white border-[#B5BDB9] glow-btn hover:bg-morandi-500'
                                 }`}
                             >
-                                {isRunning ? (timerType === 'stopwatch' ? '完成並儲存' : '暫停') : '開始'}
+                                {isRunning 
+                                    ? (timerType === 'stopwatch' ? '暫停並儲存' : '暫停') 
+                                    : '開始'
+                                }
                             </button>
 
-                            {isRunning && (
+                            {(isRunning || (timerType === 'stopwatch' && elapsedStopwatch > 0)) && (
                                 <button
                                     onClick={resetTimer}
-                                    title="重置計時器"
-                                    class="w-12 h-12 rounded-full border border-morandi-400 text-morandi-200 hover:bg-morandi-700 flex items-center justify-center transition-all"
+                                    title="重置歸零"
+                                    class="w-11 h-11 sm:w-12 sm:h-12 rounded-full border border-morandi-400 text-morandi-200 hover:bg-morandi-700 flex items-center justify-center transition-all shrink-0"
                                 >
                                     <i class="fa-solid fa-rotate-right"></i>
                                 </button>
@@ -1563,11 +1554,11 @@
             }, [records, statsPeriod]);
 
             return (
-                <div class="space-y-6 py-2">
+                <div class="space-y-4 sm:space-y-6 py-2 w-full">
                     {/* Header Controls */}
-                    <div class="flex flex-col sm:flex-row justify-between items-center gap-4 bg-morandi-800/60 p-3.5 rounded-2xl border border-morandi-700/60">
+                    <div class="flex flex-col sm:flex-row justify-between items-center gap-3 bg-morandi-800/60 p-3.5 rounded-2xl border border-morandi-700/60">
                         <div class="flex items-center space-x-2">
-                            <span class="text-[#B5BDB9] font-bold text-lg">📊 專注統計分析儀表板</span>
+                            <span class="text-[#B5BDB9] font-bold text-base sm:text-lg">📊 專注統計分析儀表板</span>
                         </div>
 
                         <div class="flex items-center space-x-3">
@@ -1592,107 +1583,50 @@
                         </div>
                     </div>
 
-                    {/* Activity Status */}
+                    {/* Activity Status Grid */}
                     <div>
-                        <h3 class="text-sm font-semibold text-morandi-200 mb-3 flex items-center space-x-2">
+                        <h3 class="text-xs sm:text-sm font-semibold text-morandi-200 mb-2.5 flex items-center space-x-2">
                             <i class="fa-solid fa-seedling text-[#B5BDB9]"></i>
                             <span>活動狀態</span>
                         </h3>
-                        <div class="grid grid-cols-2 md:grid-cols-4 gap-3 md:gap-4">
-                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 rounded-2xl flex items-center justify-between">
+                        <div class="grid grid-cols-2 md:grid-cols-4 gap-2.5 sm:gap-4">
+                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-3.5 sm:p-4 rounded-2xl flex items-center justify-between">
                                 <div>
-                                    <div class="text-xs text-morandi-300 mb-1">今日專注時間</div>
-                                    <div class="text-2xl font-bold text-[#B5BDB9]">{stats.todayFocusHours} <span class="text-xs font-normal text-morandi-300">小時</span></div>
+                                    <div class="text-[11px] sm:text-xs text-morandi-300 mb-1">今日專注時間</div>
+                                    <div class="text-xl sm:text-2xl font-bold text-[#B5BDB9]">{stats.todayFocusHours} <span class="text-xs font-normal text-morandi-300">小時</span></div>
                                 </div>
-                                <div class="w-10 h-10 rounded-full bg-morandi-600/40 text-[#B5BDB9] flex items-center justify-center text-lg">
+                                <div class="w-8 h-8 sm:w-10 sm:h-10 rounded-full bg-morandi-600/40 text-[#B5BDB9] flex items-center justify-center text-sm sm:text-lg shrink-0">
                                     <i class="fa-solid fa-clock"></i>
                                 </div>
                             </div>
 
-                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 rounded-2xl flex items-center justify-between">
+                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-3.5 sm:p-4 rounded-2xl flex items-center justify-between">
                                 <div>
-                                    <div class="text-xs text-morandi-300 mb-1">連續活動天數</div>
-                                    <div class="text-2xl font-bold text-[#B5BDB9]">{stats.currentStreak} <span class="text-xs font-normal text-morandi-300">天</span></div>
+                                    <div class="text-[11px] sm:text-xs text-morandi-300 mb-1">連續活動天數</div>
+                                    <div class="text-xl sm:text-2xl font-bold text-[#B5BDB9]">{stats.currentStreak} <span class="text-xs font-normal text-morandi-300">天</span></div>
                                 </div>
-                                <div class="w-10 h-10 rounded-full bg-emerald-600/30 text-emerald-300 flex items-center justify-center text-lg">
+                                <div class="w-8 h-8 sm:w-10 sm:h-10 rounded-full bg-emerald-600/30 text-emerald-300 flex items-center justify-center text-sm sm:text-lg shrink-0">
                                     <i class="fa-solid fa-circle-check"></i>
                                 </div>
                             </div>
 
-                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 rounded-2xl flex items-center justify-between">
+                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-3.5 sm:p-4 rounded-2xl flex items-center justify-between">
                                 <div>
-                                    <div class="text-xs text-morandi-300 mb-1">歷史最長連續活動</div>
-                                    <div class="text-2xl font-bold text-[#B5BDB9]">{stats.maxStreak} <span class="text-xs font-normal text-morandi-300">天</span></div>
+                                    <div class="text-[11px] sm:text-xs text-morandi-300 mb-1">歷史最長連續</div>
+                                    <div class="text-xl sm:text-2xl font-bold text-[#B5BDB9]">{stats.maxStreak} <span class="text-xs font-normal text-morandi-300">天</span></div>
                                 </div>
-                                <div class="w-10 h-10 rounded-full bg-amber-600/30 text-amber-300 flex items-center justify-center text-lg">
+                                <div class="w-8 h-8 sm:w-10 sm:h-10 rounded-full bg-amber-600/30 text-amber-300 flex items-center justify-center text-sm sm:text-lg shrink-0">
                                     <i class="fa-solid fa-fire"></i>
                                 </div>
                             </div>
 
-                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 rounded-2xl flex items-center justify-between">
+                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-3.5 sm:p-4 rounded-2xl flex items-center justify-between">
                                 <div>
-                                    <div class="text-xs text-morandi-300 mb-1">總活動天數</div>
-                                    <div class="text-2xl font-bold text-[#B5BDB9]">{stats.totalActiveDays} <span class="text-xs font-normal text-morandi-300">天</span></div>
+                                    <div class="text-[11px] sm:text-xs text-morandi-300 mb-1">總活動天數</div>
+                                    <div class="text-xl sm:text-2xl font-bold text-[#B5BDB9]">{stats.totalActiveDays} <span class="text-xs font-normal text-morandi-300">天</span></div>
                                 </div>
-                                <div class="w-10 h-10 rounded-full bg-teal-600/30 text-teal-300 flex items-center justify-center text-lg">
+                                <div class="w-8 h-8 sm:w-10 sm:h-10 rounded-full bg-teal-600/30 text-teal-300 flex items-center justify-center text-sm sm:text-lg shrink-0">
                                     <i class="fa-solid fa-calendar-check"></i>
-                                </div>
-                            </div>
-                        </div>
-                    </div>
-
-                    {/* Weekly Stats Cards */}
-                    <div>
-                        <h3 class="text-sm font-semibold text-morandi-200 mb-3 flex items-center space-x-2">
-                            <i class="fa-solid fa-layer-group text-[#B5BDB9]"></i>
-                            <span>{statsPeriod === 'weekly' ? '每週統計指標' : '近30日統計指標'}</span>
-                        </h3>
-                        <div class="grid grid-cols-1 md:grid-cols-3 gap-3 md:gap-4">
-                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 rounded-2xl flex flex-col justify-between">
-                                <div class="flex justify-between items-start">
-                                    <div>
-                                        <div class="text-xs text-morandi-300 mb-1">專注節數</div>
-                                        <div class="text-2xl font-bold text-[#B5BDB9]">{stats.weeklySessions} <span class="text-xs font-normal text-morandi-300">組</span></div>
-                                    </div>
-                                    <div class="w-10 h-10 rounded-full bg-amber-600/80 text-white flex items-center justify-center text-lg shadow-md">
-                                        <i class="fa-solid fa-trophy"></i>
-                                    </div>
-                                </div>
-                                <div class="mt-3 text-[11px] text-emerald-300 flex items-center justify-between pt-2 border-t border-morandi-700/40">
-                                    <span>較上週同期</span>
-                                    <span>▲ 100%</span>
-                                </div>
-                            </div>
-
-                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 rounded-2xl flex flex-col justify-between">
-                                <div class="flex justify-between items-start">
-                                    <div>
-                                        <div class="text-xs text-morandi-300 mb-1">專注時間</div>
-                                        <div class="text-2xl font-bold text-[#B5BDB9]">{stats.weeklyFocusHours} <span class="text-xs font-normal text-morandi-300">小時</span></div>
-                                    </div>
-                                    <div class="w-10 h-10 rounded-full bg-[#B5BDB9] text-morandi-900 flex items-center justify-center text-lg shadow-md">
-                                        <i class="fa-solid fa-bell"></i>
-                                    </div>
-                                </div>
-                                <div class="mt-3 text-[11px] text-emerald-300 flex items-center justify-between pt-2 border-t border-morandi-700/40">
-                                    <span>較上週同期</span>
-                                    <span>▲ 100%</span>
-                                </div>
-                            </div>
-
-                            <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 rounded-2xl flex flex-col justify-between">
-                                <div class="flex justify-between items-start">
-                                    <div>
-                                        <div class="text-xs text-morandi-300 mb-1">休息時間</div>
-                                        <div class="text-2xl font-bold text-[#B5BDB9]">{stats.weeklyRestHours} <span class="text-xs font-normal text-morandi-300">小時</span></div>
-                                    </div>
-                                    <div class="w-10 h-10 rounded-full bg-teal-600/80 text-white flex items-center justify-center text-lg shadow-md">
-                                        <i class="fa-solid fa-mug-saucer"></i>
-                                    </div>
-                                </div>
-                                <div class="mt-3 text-[11px] text-emerald-300 flex items-center justify-between pt-2 border-t border-morandi-700/40">
-                                    <span>較上週同期</span>
-                                    <span>▲ 100%</span>
                                 </div>
                             </div>
                         </div>
@@ -1700,23 +1634,23 @@
 
                     {/* Chart & Ranking Section */}
                     <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
-                        <div class="lg:col-span-2 bg-morandi-800/60 border border-morandi-700/60 p-5 rounded-2xl flex flex-col justify-between">
-                            <div class="flex justify-between items-center mb-4">
-                                <span class="text-sm font-semibold text-[#B5BDB9]">專注時長趨勢</span>
-                                <span class="text-xs text-morandi-300">單位：小時</span>
+                        <div class="lg:col-span-2 bg-morandi-800/60 border border-morandi-700/60 p-4 sm:p-5 rounded-2xl flex flex-col justify-between">
+                            <div class="flex justify-between items-center mb-3">
+                                <span class="text-xs sm:text-sm font-semibold text-[#B5BDB9]">專注時長趨勢</span>
+                                <span class="text-[11px] text-morandi-300">單位：小時</span>
                             </div>
-                            <div class="h-52 w-full">
+                            <div class="h-48 sm:h-56 w-full">
                                 <canvas id="statsChart"></canvas>
                             </div>
                         </div>
 
-                        <div class="space-y-4">
+                        <div class="space-y-3 sm:space-y-4">
                             <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 rounded-2xl">
-                                <div class="text-sm font-semibold text-[#B5BDB9] mb-3 flex items-center justify-between">
+                                <div class="text-xs sm:text-sm font-semibold text-[#B5BDB9] mb-3 flex items-center justify-between">
                                     <span>本週最專注的事</span>
                                     <i class="fa-solid fa-list-ol text-xs text-morandi-300"></i>
                                 </div>
-                                <div class="space-y-2.5">
+                                <div class="space-y-2">
                                     {stats.topTasks.length === 0 ? (
                                         <div class="text-center py-4 text-xs text-morandi-300">目前尚無專注紀錄</div>
                                     ) : (
@@ -1724,9 +1658,9 @@
                                             <div key={idx} class="flex items-center justify-between text-xs bg-morandi-900/50 p-2.5 rounded-xl border border-morandi-700/40">
                                                 <div class="flex items-center space-x-2">
                                                     <span class="w-3 h-3 rounded-full shrink-0 shadow-sm" style={{ backgroundColor: t.color }}></span>
-                                                    <span class="text-morandi-100 font-medium">{t.name}</span>
+                                                    <span class="text-morandi-100 font-medium truncate max-w-[120px] sm:max-w-[160px]">{t.name}</span>
                                                 </div>
-                                                <span class="text-morandi-300 font-mono">{t.hours} 小時</span>
+                                                <span class="text-morandi-300 font-mono shrink-0">{t.hours} 小時</span>
                                             </div>
                                         ))
                                     )}
@@ -1736,7 +1670,7 @@
                             <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 rounded-2xl flex items-center justify-between">
                                 <div>
                                     <div class="text-xs text-morandi-300 mb-1">每日平均專注時間</div>
-                                    <div class="text-2xl font-bold text-[#B5BDB9]">{stats.dailyAvgFocusHours} <span class="text-xs font-normal text-morandi-300">小時/天</span></div>
+                                    <div class="text-xl sm:text-2xl font-bold text-[#B5BDB9]">{stats.dailyAvgFocusHours} <span class="text-xs font-normal text-morandi-300">小時/天</span></div>
                                 </div>
                                 <div class="text-2xl text-[#B5BDB9]">
                                     <i class="fa-solid fa-chart-line"></i>
@@ -1757,7 +1691,7 @@
                 if (!newTaskName.trim()) return;
 
                 const newTask = {
-                    id: Date.now().toString(),
+                    id: `task_${Date.now()}`,
                     name: newTaskName.trim(),
                     icon: 'fa-bookmark',
                     color: selectedColorHex
@@ -1775,14 +1709,14 @@
             };
 
             return (
-                <div class="max-w-3xl mx-auto w-full py-4 space-y-6">
+                <div class="max-w-3xl mx-auto w-full py-2 sm:py-4 space-y-4 sm:space-y-6">
                     {/* Add New Task Card */}
-                    <div class="bg-morandi-800/60 border border-morandi-700/60 p-6 rounded-2xl shadow-lg">
-                        <h3 class="text-base font-bold text-[#B5BDB9] mb-4 flex items-center space-x-2">
+                    <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 sm:p-6 rounded-2xl shadow-lg">
+                        <h3 class="text-sm sm:text-base font-bold text-[#B5BDB9] mb-3 sm:mb-4 flex items-center space-x-2">
                             <i class="fa-solid fa-plus text-[#B5BDB9]"></i>
                             <span>新增自訂待辦項目</span>
                         </h3>
-                        <form onSubmit={handleAddTask} class="space-y-4">
+                        <form onSubmit={handleAddTask} class="space-y-3 sm:space-y-4">
                             <div>
                                 <label class="block text-xs text-morandi-300 mb-1.5">目標名稱</label>
                                 <input
@@ -1790,27 +1724,27 @@
                                     placeholder="例如：寫專案程式、讀日文..."
                                     value={newTaskName}
                                     onChange={(e) => setNewTaskName(e.target.value)}
-                                    class="w-full bg-morandi-900/80 border border-morandi-700 text-white rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-[#B5BDB9]"
+                                    class="w-full bg-morandi-900/80 border border-morandi-700 text-white rounded-xl px-3.5 py-2 sm:py-2.5 text-xs sm:text-sm focus:outline-none focus:border-[#B5BDB9]"
                                 />
                             </div>
                             
                             {/* Morandi Color Palette Picker */}
                             <div>
                                 <label class="block text-xs text-morandi-300 mb-2">選擇類別色彩 (莫蘭迪色系)</label>
-                                <div class="flex flex-wrap gap-2.5">
+                                <div class="flex flex-wrap gap-2">
                                     {MORANDI_PALETTE.map(item => (
                                         <button
                                             key={item.id}
                                             type="button"
                                             onClick={() => setSelectedColorHex(item.hex)}
-                                            class={`relative w-8 h-8 rounded-lg transition-transform flex items-center justify-center shadow-md ${
+                                            class={`relative w-7 h-7 sm:w-8 sm:h-8 rounded-lg transition-transform flex items-center justify-center shadow-md ${
                                                 selectedColorHex === item.hex ? 'scale-110 ring-2 ring-white' : 'hover:scale-105 opacity-85'
                                             }`}
                                             style={{ backgroundColor: item.hex }}
                                             title={item.name}
                                         >
                                             {selectedColorHex === item.hex && (
-                                                <i class="fa-solid fa-check text-white text-xs drop-shadow"></i>
+                                                <i class="fa-solid fa-check text-white text-[10px] sm:text-xs drop-shadow"></i>
                                             )}
                                         </button>
                                     ))}
@@ -1819,7 +1753,7 @@
 
                             <button
                                 type="submit"
-                                class="w-full py-2.5 bg-[#B5BDB9] hover:bg-white text-morandi-900 font-bold text-sm rounded-xl transition-all shadow-md mt-2"
+                                class="w-full py-2.5 bg-[#B5BDB9] hover:bg-white text-morandi-900 font-bold text-xs sm:text-sm rounded-xl transition-all shadow-md mt-1"
                             >
                                 新增項目
                             </button>
@@ -1827,13 +1761,13 @@
                     </div>
 
                     {/* Existing Task List Card */}
-                    <div class="bg-morandi-800/60 border border-morandi-700/60 p-6 rounded-2xl shadow-lg">
-                        <div class="flex items-center justify-between mb-4">
-                            <h3 class="text-base font-bold text-[#B5BDB9]">現有待辦清單</h3>
+                    <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 sm:p-6 rounded-2xl shadow-lg">
+                        <div class="flex items-center justify-between mb-3 sm:mb-4">
+                            <h3 class="text-sm sm:text-base font-bold text-[#B5BDB9]">現有待辦清單</h3>
                             <span class="text-xs font-normal text-morandi-300">共 {tasks.length} 個項目</span>
                         </div>
 
-                        <div class="space-y-3">
+                        <div class="space-y-2.5">
                             {tasks.map(t => {
                                 const totalSec = records
                                     .filter(r => r.taskId === t.id && r.mode === 'focus')
@@ -1841,28 +1775,26 @@
                                 const totalHours = (totalSec / 3600).toFixed(1);
 
                                 return (
-                                    <div key={t.id} class="flex items-center justify-between bg-morandi-900/60 p-3.5 rounded-xl border border-morandi-700/50 hover:border-morandi-600 transition-all">
-                                        <div class="flex items-center space-x-3">
-                                            <div class="w-4 h-4 rounded-full shadow-sm" style={{ backgroundColor: t.color }}></div>
-                                            <span class="text-morandi-100 font-medium text-sm">{t.name}</span>
+                                    <div key={t.id} class="flex items-center justify-between bg-morandi-900/60 p-3 sm:p-3.5 rounded-xl border border-morandi-700/50 hover:border-morandi-600 transition-all">
+                                        <div class="flex items-center space-x-2.5 min-w-0 flex-grow mr-2">
+                                            <div class="w-3.5 h-3.5 rounded-full shadow-sm shrink-0" style={{ backgroundColor: t.color }}></div>
+                                            <span class="text-morandi-100 font-medium text-xs sm:text-sm truncate">{t.name}</span>
                                         </div>
 
-                                        <div class="flex items-center space-x-4">
-                                            <span class="text-xs text-morandi-300 font-mono">累計專注：{totalHours} 小時</span>
+                                        <div class="flex items-center space-x-2 sm:space-x-4 shrink-0">
+                                            <span class="text-[11px] sm:text-xs text-morandi-300 font-mono">累計：{totalHours}小時</span>
                                             
-                                            {/* Edit Button */}
                                             <button
                                                 onClick={() => openEditModal(t)}
-                                                class="text-morandi-300 hover:text-[#B5BDB9] text-sm transition-colors p-1"
+                                                class="text-morandi-300 hover:text-[#B5BDB9] text-xs sm:text-sm transition-colors p-1"
                                                 title="編輯"
                                             >
                                                 <i class="fa-solid fa-pen"></i>
                                             </button>
 
-                                            {/* Delete Button */}
                                             <button
                                                 onClick={() => handleDeleteTask(t.id)}
-                                                class="text-morandi-400 hover:text-rose-400 text-sm transition-colors p-1"
+                                                class="text-morandi-400 hover:text-rose-400 text-xs sm:text-sm transition-colors p-1"
                                                 title="刪除"
                                             >
                                                 <i class="fa-solid fa-trash-can"></i>
@@ -1889,7 +1821,7 @@
                     setTasks(tasks.map(t => t.id === editingTask.id ? { ...t, name: name.trim(), color: colorHex } : t));
                 } else {
                     const newTask = {
-                        id: Date.now().toString(),
+                        id: `task_${Date.now()}`,
                         name: name.trim(),
                         icon: 'fa-bookmark',
                         color: colorHex
@@ -1901,7 +1833,7 @@
 
             return (
                 <div class="fixed inset-0 bg-black/60 backdrop-blur-sm z-50 flex items-center justify-center p-4">
-                    <div class="bg-morandi-800 border border-morandi-600 w-full max-w-md rounded-2xl p-6 shadow-2xl relative">
+                    <div class="bg-morandi-800 border border-morandi-600 w-full max-w-md rounded-2xl p-5 sm:p-6 shadow-2xl relative">
                         <button
                             onClick={onClose}
                             class="absolute top-4 right-4 text-morandi-300 hover:text-white text-lg"
@@ -1909,11 +1841,11 @@
                             <i class="fa-solid fa-xmark"></i>
                         </button>
 
-                        <h3 class="text-lg font-bold text-[#B5BDB9] mb-4">
+                        <h3 class="text-base sm:text-lg font-bold text-[#B5BDB9] mb-4">
                             {editingTask ? '編輯待辦項目' : '新增待辦目標'}
                         </h3>
 
-                        <form onSubmit={handleSubmit} class="space-y-5">
+                        <form onSubmit={handleSubmit} class="space-y-4">
                             <div>
                                 <label class="block text-xs text-morandi-300 mb-1.5">目標名稱</label>
                                 <input
@@ -1922,19 +1854,19 @@
                                     value={name}
                                     onChange={(e) => setName(e.target.value)}
                                     autoFocus
-                                    class="w-full bg-morandi-900 border border-morandi-700 text-white rounded-xl px-4 py-2.5 text-sm focus:outline-none focus:border-[#B5BDB9]"
+                                    class="w-full bg-morandi-900 border border-morandi-700 text-white rounded-xl px-3.5 py-2 text-xs sm:text-sm focus:outline-none focus:border-[#B5BDB9]"
                                 />
                             </div>
 
                             <div>
                                 <label class="block text-xs text-morandi-300 mb-2">選擇類別色彩</label>
-                                <div class="grid grid-cols-4 gap-2.5">
+                                <div class="grid grid-cols-4 gap-2">
                                     {MORANDI_PALETTE.map(item => (
                                         <button
                                             key={item.id}
                                             type="button"
                                             onClick={() => setColorHex(item.hex)}
-                                            class={`h-10 rounded-xl flex items-center justify-center shadow-md transition-all ${
+                                            class={`h-9 rounded-xl flex items-center justify-center shadow-md transition-all ${
                                                 colorHex === item.hex ? 'ring-2 ring-white scale-105 font-bold' : 'opacity-80 hover:opacity-100'
                                             }`}
                                             style={{ backgroundColor: item.hex }}
@@ -1947,7 +1879,7 @@
                                 </div>
                             </div>
 
-                            <div class="flex justify-end space-x-3 pt-2">
+                            <div class="flex justify-end space-x-2 pt-2">
                                 <button
                                     type="button"
                                     onClick={onClose}
