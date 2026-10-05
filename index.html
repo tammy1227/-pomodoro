@@ -65,12 +65,10 @@
         const auth = getAuth(app);
         const db = getFirestore(app);
 
-        // Ensure persistence across tabs/devices
         setPersistence(auth, browserLocalPersistence).catch(err => {
             console.warn('Auth persistence notice:', err);
         });
 
-        // Initial Auth Setup
         const initialAuthToken = typeof __initial_auth_token !== 'undefined' ? __initial_auth_token : null;
         if (initialAuthToken) {
             signInWithCustomToken(auth, initialAuthToken).catch(err => {
@@ -83,7 +81,6 @@
             });
         }
 
-        // Expose Firebase services globally for React components
         window.FirebaseServices = {
             appId,
             firebaseConfig,
@@ -148,7 +145,6 @@
             background-attachment: fixed;
             transition: background-image 0.3s ease-in-out;
         }
-        /* Custom Scrollbar */
         ::-webkit-scrollbar {
             width: 6px;
             height: 6px;
@@ -201,9 +197,44 @@
             { id: 'teal', name: '尤加利青', hex: '#5B8266' }
         ];
 
+        // Background Web Worker Blob Source (High Accuracy Ticker)
+        const workerBlobCode = `
+            let timerId = null;
+            self.onmessage = function(e) {
+                if (e.data === 'start') {
+                    if (timerId) clearInterval(timerId);
+                    timerId = setInterval(() => {
+                        self.postMessage('tick');
+                    }, 200);
+                } else if (e.data === 'stop') {
+                    if (timerId) {
+                        clearInterval(timerId);
+                        timerId = null;
+                    }
+                }
+            };
+        `;
+        const workerBlobUrl = URL.createObjectURL(new Blob([workerBlobCode], { type: 'application/javascript' }));
+
+        const sendNotification = (title, body) => {
+            if ("Notification" in window && Notification.permission === "granted") {
+                try {
+                    new Notification(title, {
+                        body: body,
+                        icon: 'data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%%22 y=%2250%%22 dominant-baseline=%22central%22 text-anchor=%22middle%22 font-size=%2265%22>🍅</text></svg>'
+                    });
+                } catch(e) {
+                    console.log('Notification error:', e);
+                }
+            }
+        };
+
         const playBeep = (type = 'finish') => {
             try {
                 const ctx = new (window.AudioContext || window.webkitAudioContext)();
+                if (ctx.state === 'suspended') {
+                    ctx.resume();
+                }
                 const osc = ctx.createOscillator();
                 const gain = ctx.createGain();
                 osc.connect(gain);
@@ -271,24 +302,25 @@
             const [isRunning, setIsRunning] = React.useState(false);
             const [sessionCount, setSessionCount] = React.useState(1);
 
-            // Background & Transparency State
-            const [bgImage, setBgImage] = React.useState(() => {
-                return localStorage.getItem('ff_bg_image') || '';
-            });
+            // High Precision Timestamp Tracking References
+            const targetEndTimeRef = React.useRef(null);
+            const stopwatchStartTimeRef = React.useRef(null);
+            const wakeLockRef = React.useRef(null);
+            const workerRef = React.useRef(null);
 
+            // Background & Visuals State
+            const [bgImage, setBgImage] = React.useState(() => localStorage.getItem('ff_bg_image') || '');
             const [bgOpacity, setBgOpacity] = React.useState(() => {
-                const savedOpacity = localStorage.getItem('ff_bg_opacity');
-                return savedOpacity !== null ? parseFloat(savedOpacity) : 0.78;
+                const saved = localStorage.getItem('ff_bg_opacity');
+                return saved !== null ? parseFloat(saved) : 0.78;
             });
-
             const [bgBlur, setBgBlur] = React.useState(() => {
-                const savedBlur = localStorage.getItem('ff_bg_blur');
-                return savedBlur !== null ? parseInt(savedBlur, 10) : 8;
+                const saved = localStorage.getItem('ff_bg_blur');
+                return saved !== null ? parseInt(saved, 10) : 8;
             });
-
             const [showOpacitySlider, setShowOpacitySlider] = React.useState(false);
 
-            // Image Crop Modal States
+            // Image Crop Modal
             const [cropModalOpen, setCropModalOpen] = React.useState(false);
             const [rawImageSrc, setRawImageSrc] = React.useState('');
 
@@ -306,6 +338,13 @@
                 return saved ? JSON.parse(saved) : [];
             });
 
+            // Request Notification Permission on first interaction
+            React.useEffect(() => {
+                if ("Notification" in window && Notification.permission === "default") {
+                    Notification.requestPermission().catch(() => {});
+                }
+            }, []);
+
             // Firebase Auth Listener
             React.useEffect(() => {
                 if (!window.FirebaseServices) return;
@@ -317,6 +356,7 @@
                 return () => unsubscribe();
             }, []);
 
+            // Firestore Data Sync
             React.useEffect(() => {
                 if (!user || !window.FirebaseServices) return;
                 const { db, collection, onSnapshot, doc, setDoc } = window.FirebaseServices;
@@ -339,7 +379,6 @@
                     setIsSyncing(false);
                     setCloudSyncError(false);
                 }, (error) => {
-                    console.warn("Firestore tasks sync fallback to local:", error.message);
                     setIsSyncing(false);
                     setCloudSyncError(true);
                 });
@@ -367,7 +406,6 @@
                     setIsSyncing(false);
                     setCloudSyncError(false);
                 }, (error) => {
-                    console.warn("Firestore records sync fallback to local:", error.message);
                     setIsSyncing(false);
                     setCloudSyncError(true);
                 });
@@ -445,7 +483,7 @@
                 try {
                     localStorage.setItem('ff_bg_image', croppedDataUrl);
                 } catch (err) {
-                    console.warn('LocalStorage limit exceeded for background image');
+                    console.warn('LocalStorage limit exceeded');
                 }
                 setCropModalOpen(false);
                 setRawImageSrc('');
@@ -464,34 +502,108 @@
                 }
             }, [mode, timerType, modeDurations]);
 
-            React.useEffect(() => {
-                let timer = null;
-                if (isRunning) {
-                    timer = setInterval(() => {
-                        if (timerType === 'pomodoro') {
-                            setSeconds((prev) => {
-                                if (prev <= 1) {
-                                    clearInterval(timer);
-                                    handleSessionComplete();
-                                    return 0;
-                                }
-                                return prev - 1;
-                            });
-                        } else {
-                            setElapsedStopwatch((prev) => prev + 1);
-                        }
-                    }, 1000);
-                } else {
-                    clearInterval(timer);
+            // Request Screen Wake Lock (Keep screen on when active)
+            const requestWakeLock = async () => {
+                try {
+                    if ('wakeLock' in navigator) {
+                        wakeLockRef.current = await navigator.wakeLock.request('screen');
+                    }
+                } catch (err) {
+                    console.log('WakeLock error:', err);
                 }
-                return () => clearInterval(timer);
-            }, [isRunning, timerType, mode, seconds]);
+            };
+
+            const releaseWakeLock = () => {
+                if (wakeLockRef.current) {
+                    wakeLockRef.current.release().catch(() => {});
+                    wakeLockRef.current = null;
+                }
+            };
+
+            // Main Background-Resilient Timer Logic
+            const tickUpdate = React.useCallback(() => {
+                if (!isRunning) return;
+
+                const now = Date.now();
+                if (timerType === 'pomodoro') {
+                    if (!targetEndTimeRef.current) return;
+                    const diffMs = targetEndTimeRef.current - now;
+                    const remainingSec = Math.max(0, Math.ceil(diffMs / 1000));
+                    setSeconds(remainingSec);
+
+                    if (diffMs <= 0) {
+                        handleSessionComplete();
+                    }
+                } else {
+                    if (!stopwatchStartTimeRef.current) return;
+                    const elapsedSec = Math.max(0, Math.floor((now - stopwatchStartTimeRef.current) / 1000));
+                    setElapsedStopwatch(elapsedSec);
+                }
+            }, [isRunning, timerType, mode]);
+
+            // Web Worker Initialization and Ticking
+            React.useEffect(() => {
+                if (isRunning) {
+                    requestWakeLock();
+
+                    // Web Worker for reliable background ticking
+                    try {
+                        const worker = new Worker(workerBlobUrl);
+                        workerRef.current = worker;
+                        worker.onmessage = () => {
+                            tickUpdate();
+                        };
+                        worker.postMessage('start');
+                    } catch (e) {
+                        console.warn('Worker initialization fallback to setInterval:', e);
+                    }
+
+                    const intervalFallback = setInterval(tickUpdate, 250);
+
+                    // Re-sync instantly on Page Visibility Change (Foreground Return)
+                    const handleVisibilityChange = () => {
+                        if (document.visibilityState === 'visible') {
+                            tickUpdate();
+                            if (isRunning && 'wakeLock' in navigator) {
+                                requestWakeLock();
+                            }
+                        }
+                    };
+
+                    document.addEventListener('visibilitychange', handleVisibilityChange);
+                    window.addEventListener('focus', handleVisibilityChange);
+
+                    return () => {
+                        if (workerRef.current) {
+                            workerRef.current.postMessage('stop');
+                            workerRef.current.terminate();
+                            workerRef.current = null;
+                        }
+                        clearInterval(intervalFallback);
+                        document.removeEventListener('visibilitychange', handleVisibilityChange);
+                        window.removeEventListener('focus', handleVisibilityChange);
+                        releaseWakeLock();
+                    };
+                } else {
+                    releaseWakeLock();
+                }
+            }, [isRunning, tickUpdate]);
 
             const handleSessionComplete = () => {
                 setIsRunning(false);
+                releaseWakeLock();
+
+                let duration = 0;
+                if (timerType === 'pomodoro') {
+                    duration = modeDurations[mode];
+                    setSeconds(0);
+                } else {
+                    duration = elapsedStopwatch;
+                }
+
                 playBeep('finish');
-                
-                const duration = timerType === 'pomodoro' ? modeDurations[mode] : elapsedStopwatch;
+                const taskName = tasks.find(t => t.id === selectedTaskId)?.name || '專注項目';
+                sendNotification('🎉 專注時間完成！', `您剛完成了 ${taskName} 的專注時段！`);
                 
                 if (duration > 0) {
                     const newRecord = {
@@ -516,21 +628,62 @@
 
             const toggleTimer = () => {
                 playBeep('click');
-                if (isRunning && timerType === 'stopwatch') {
-                    handleSessionComplete();
+
+                if (isRunning) {
+                    // Pause timer
+                    setIsRunning(false);
+                    if (timerType === 'stopwatch') {
+                        handleSessionComplete();
+                    }
                 } else {
-                    setIsRunning(!isRunning);
+                    // Start timer: Set exact timestamps
+                    const now = Date.now();
+                    if (timerType === 'pomodoro') {
+                        targetEndTimeRef.current = now + seconds * 1000;
+                    } else {
+                        stopwatchStartTimeRef.current = now - elapsedStopwatch * 1000;
+                    }
+                    setIsRunning(true);
                 }
             };
 
             const resetTimer = () => {
                 playBeep('click');
                 setIsRunning(false);
+                releaseWakeLock();
+                targetEndTimeRef.current = null;
+
                 if (timerType === 'pomodoro') {
                     setSeconds(modeDurations[mode]);
                 } else {
                     setElapsedStopwatch(0);
                 }
+            };
+
+            const savePartialPomodoroSession = () => {
+                playBeep('finish');
+                setIsRunning(false);
+                releaseWakeLock();
+                targetEndTimeRef.current = null;
+
+                const elapsed = modeDurations[mode] - seconds;
+                if (elapsed > 0) {
+                    const newRecord = {
+                        id: `rec_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`,
+                        taskId: selectedTaskId,
+                        mode: mode,
+                        durationSeconds: elapsed,
+                        timestamp: Date.now(),
+                        date: formatDate(new Date())
+                    };
+                    updateRecordsWithSync(newRecord);
+                    
+                    if (mode === 'focus') {
+                        setSessionCount(prev => prev + 1);
+                    }
+                }
+
+                setSeconds(modeDurations[mode]);
             };
 
             const generateMockData = () => {
@@ -749,10 +902,12 @@
                                 timerType={timerType}
                                 setTimerType={setTimerType}
                                 seconds={seconds}
+                                modeDuration={modeDurations[mode]}
                                 elapsedStopwatch={elapsedStopwatch}
                                 isRunning={isRunning}
                                 toggleTimer={toggleTimer}
                                 resetTimer={resetTimer}
+                                savePartialPomodoroSession={savePartialPomodoroSession}
                                 sessionCount={sessionCount}
                                 tasks={tasks}
                                 selectedTaskId={selectedTaskId}
@@ -844,7 +999,6 @@
                     setSuccessMsg('Google 帳號登入成功！跨裝置數據正同步中...');
                     setTimeout(() => onClose(), 1200);
                 } catch (err) {
-                    console.error('Google Sign-in Error:', err);
                     let readableErr = err.message;
                     if (err.code === 'auth/popup-closed-by-user') readableErr = '登入視窗已關閉';
                     if (err.code === 'auth/popup-blocked') readableErr = '請允許瀏覽器彈出視窗以進行 Google 登入';
@@ -877,7 +1031,6 @@
                     }
                     setTimeout(() => onClose(), 1200);
                 } catch (err) {
-                    console.error('Email Auth Error:', err);
                     let readableErr = err.message;
                     if (err.code === 'auth/wrong-password' || err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential') readableErr = 'Email 或密碼不正確';
                     if (err.code === 'auth/email-already-in-use') readableErr = '此 Email 已被註冊，請直接登入';
@@ -1044,11 +1197,9 @@
             const [isPreviewOverlay, setIsPreviewOverlay] = React.useState(true);
             const imgRef = React.useRef(null);
 
-            // Detect initial device screen ratio (defaults to 9:16 for portrait mobile)
             const isInitialPortrait = window.innerWidth < window.innerHeight;
             const [aspectMode, setAspectMode] = React.useState(isInitialPortrait ? '9:16' : '16:9');
 
-            // Calculate canvas size and display aspect ratio dynamically
             const getDimensions = React.useCallback(() => {
                 if (aspectMode === '9:16') {
                     return { width: 720, height: 1280, ratioStr: '9/16' };
@@ -1059,7 +1210,6 @@
                     const targetH = Math.round(1080 * (h / w));
                     return { width: targetW, height: targetH, ratioStr: `${w}/${h}` };
                 } else {
-                    // '16:9'
                     return { width: 1280, height: 720, ratioStr: '16/9' };
                 }
             }, [aspectMode]);
@@ -1102,7 +1252,6 @@
                 ctx.drawImage(img, x, y, width, height);
             };
 
-            // Touch and Mouse positions helper
             const getPointerPos = (e) => {
                 if (e.touches && e.touches.length > 0) {
                     return { x: e.touches[0].clientX, y: e.touches[0].clientY };
@@ -1152,7 +1301,6 @@
                             </button>
                         </div>
 
-                        {/* Aspect Ratio Selector */}
                         <div class="flex items-center justify-between bg-morandi-800/80 px-3 py-2 rounded-xl border border-morandi-700 text-xs">
                             <span class="text-morandi-300 font-medium shrink-0">裁切比例：</span>
                             <div class="flex items-center space-x-1 sm:space-x-2">
@@ -1186,7 +1334,6 @@
                             </div>
                         </div>
 
-                        {/* Interactive Canvas Viewport (Supports Mouse & Touch Dragging) */}
                         <div 
                             class="relative w-full overflow-hidden rounded-2xl border border-morandi-600 bg-black flex items-center justify-center select-none cursor-grab active:cursor-grabbing max-h-[50vh] sm:max-h-[55vh] mx-auto my-auto"
                             onMouseDown={handleStart}
@@ -1223,9 +1370,7 @@
                             )}
                         </div>
 
-                        {/* Controls Bar */}
                         <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 items-center bg-morandi-800/60 p-2.5 rounded-2xl border border-morandi-700/60">
-                            {/* Zoom Slider */}
                             <div class="flex items-center space-x-2.5">
                                 <i class="fa-solid fa-magnifying-glass-minus text-xs text-morandi-300"></i>
                                 <input
@@ -1262,7 +1407,6 @@
                             </div>
                         </div>
 
-                        {/* Action Buttons */}
                         <div class="flex justify-end space-x-2 pt-1">
                             <button
                                 type="button"
@@ -1287,8 +1431,8 @@
         function TimerView({
             mode, setMode,
             timerType, setTimerType,
-            seconds, elapsedStopwatch,
-            isRunning, toggleTimer, resetTimer,
+            seconds, modeDuration, elapsedStopwatch,
+            isRunning, toggleTimer, resetTimer, savePartialPomodoroSession,
             sessionCount, tasks, selectedTaskId, setSelectedTaskId,
             setIsEditingTaskModal, setEditingTaskData
         }) {
@@ -1308,6 +1452,9 @@
                 }
                 return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
             };
+
+            const isPomodoroPaused = timerType === 'pomodoro' && !isRunning && seconds < modeDuration && seconds > 0;
+            const pomodoroElapsed = modeDuration - seconds;
 
             return (
                 <div class="flex flex-col items-center justify-center py-2 sm:py-4 w-full">
@@ -1362,7 +1509,7 @@
                     }`}>
                         <div class="absolute top-3 sm:top-4 right-4 sm:right-6 text-[11px] sm:text-xs text-morandi-200 flex items-center space-x-1.5">
                             <span class={`w-2 h-2 rounded-full ${isRunning ? 'bg-[#B5BDB9] animate-ping' : 'bg-morandi-400'}`}></span>
-                            <span>{isRunning ? (timerType === 'pomodoro' ? '專注進行中...' : '正計時中...') : (timerType === 'pomodoro' ? '倒數模式' : '正計時模式')}</span>
+                            <span>{isRunning ? (timerType === 'pomodoro' ? '背景精確專注中...' : '背景正計時中...') : (timerType === 'pomodoro' ? '倒數模式' : '正計時模式')}</span>
                         </div>
 
                         <div class="text-5xl sm:text-7xl md:text-8xl font-mono font-bold tracking-tight text-[#B5BDB9] my-4 sm:my-6 drop-shadow-md select-none">
@@ -1391,21 +1538,24 @@
                                 <button
                                     disabled={isRunning}
                                     onClick={() => {
-                                        setEditingTaskData(null);
-                                        setIsEditingTaskModal(true);
+                                        const currentTask = tasks.find(t => t.id === selectedTaskId);
+                                        if (currentTask) {
+                                            setEditingTaskData(currentTask);
+                                            setIsEditingTaskModal(true);
+                                        }
                                     }}
-                                    title="新增或編輯項目"
-                                    class={`text-[#B5BDB9] hover:text-white ml-2 transition-colors ${isRunning ? 'opacity-40 cursor-not-allowed' : ''}`}
+                                    class="p-1 text-morandi-300 hover:text-[#B5BDB9] text-xs transition-colors shrink-0"
+                                    title="編輯目前項目"
                                 >
-                                    <i class="fa-solid fa-plus-circle"></i>
+                                    <i class="fa-solid fa-pen"></i>
                                 </button>
                             </div>
                         </div>
 
-                        <div class="mt-8 sm:mt-10 flex items-center space-x-3 sm:space-x-4">
+                        <div class="mt-8 sm:mt-10 flex flex-wrap items-center justify-center gap-3 sm:gap-4">
                             <button
                                 onClick={toggleTimer}
-                                class={`px-8 sm:px-12 py-3 sm:py-3.5 rounded-full border-2 text-lg sm:text-2xl font-semibold tracking-wider transition-all transform active:scale-95 ${
+                                class={`px-8 sm:px-10 py-3 sm:py-3.5 rounded-full border-2 text-lg sm:text-2xl font-semibold tracking-wider transition-all transform active:scale-95 ${
                                     isRunning 
                                         ? 'bg-amber-700/90 hover:bg-amber-600 text-white border-amber-300' 
                                         : 'bg-morandi-600 text-white border-[#B5BDB9] glow-btn hover:bg-morandi-500'
@@ -1413,11 +1563,22 @@
                             >
                                 {isRunning 
                                     ? (timerType === 'stopwatch' ? '暫停並儲存' : '暫停') 
-                                    : '開始'
+                                    : (isPomodoroPaused ? '繼續' : '開始')
                                 }
                             </button>
 
-                            {(isRunning || (timerType === 'stopwatch' && elapsedStopwatch > 0)) && (
+                            {isPomodoroPaused && (
+                                <button
+                                    onClick={savePartialPomodoroSession}
+                                    title="儲存到目前為止的專注時數"
+                                    class="px-5 py-3 sm:py-3.5 rounded-full bg-emerald-800/90 hover:bg-emerald-700 border border-emerald-400/70 text-emerald-100 text-xs sm:text-sm font-bold flex items-center space-x-2 transition-all shadow-md transform active:scale-95"
+                                >
+                                    <i class="fa-solid fa-floppy-disk"></i>
+                                    <span>儲存目前時數 ({Math.floor(pomodoroElapsed / 60)}分{pomodoroElapsed % 60}秒)</span>
+                                </button>
+                            )}
+
+                            {(isRunning || isPomodoroPaused || (timerType === 'stopwatch' && elapsedStopwatch > 0)) && (
                                 <button
                                     onClick={resetTimer}
                                     title="重置歸零"
@@ -1866,7 +2027,7 @@
                     <div class="bg-morandi-800 border border-morandi-600 w-full max-w-md rounded-2xl p-5 sm:p-6 shadow-2xl relative">
                         <button
                             onClick={onClose}
-                            class="absolute top-4 right-4 text-morandi-300 hover:text-white text-lg"
+                            class="absolute top-4 right-4 text-morandi-300 hover:text-[#B5BDB9] text-lg"
                         >
                             <i class="fa-solid fa-xmark"></i>
                         </button>
