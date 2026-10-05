@@ -44,8 +44,7 @@
             getDoc, 
             collection, 
             onSnapshot,
-            query,
-            orderBy
+            query
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Global Firebase Environment & Config
@@ -313,7 +312,7 @@
                 const { auth, onAuthStateChanged } = window.FirebaseServices;
                 const unsubscribe = onAuthStateChanged(auth, (currentUser) => {
                     setUser(currentUser);
-                    setCloudSyncError(false); // Reset permission error state on user login state change
+                    setCloudSyncError(false);
                 });
                 return () => unsubscribe();
             }, []);
@@ -323,7 +322,6 @@
                 const { db, collection, onSnapshot, doc, setDoc } = window.FirebaseServices;
                 setIsSyncing(true);
 
-                // Unified user collection path for seamless cross-device synchronization
                 const tasksColRef = collection(db, 'users', user.uid, 'tasks');
                 const unsubscribeTasks = onSnapshot(tasksColRef, (snapshot) => {
                     if (!snapshot.empty) {
@@ -332,7 +330,6 @@
                         setTasks(fetchedTasks);
                         localStorage.setItem('ff_tasks_morandi', JSON.stringify(fetchedTasks));
                     } else {
-                        // First time initializing user tasks in cloud
                         tasks.forEach(t => {
                             setDoc(doc(db, 'users', user.uid, 'tasks', t.id), t).catch(err => {
                                 console.warn('Task sync setDoc warning:', err.message);
@@ -347,21 +344,17 @@
                     setCloudSyncError(true);
                 });
 
-                // User records cloud path
                 const recordsColRef = collection(db, 'users', user.uid, 'records');
                 const unsubscribeRecords = onSnapshot(recordsColRef, (snapshot) => {
                     const fetchedRecords = [];
                     snapshot.forEach(doc => fetchedRecords.push({ id: doc.id, ...doc.data() }));
 
                     const localRecords = JSON.parse(localStorage.getItem('ff_records_morandi') || '[]');
-                    
-                    // Merge local & cloud records (deduplicate by record ID)
                     const recordMap = new Map();
                     fetchedRecords.forEach(r => recordMap.set(r.id, r));
                     localRecords.forEach(r => {
                         if (!recordMap.has(r.id)) {
                             recordMap.set(r.id, r);
-                            // Upload local-only record to cloud
                             setDoc(doc(db, 'users', user.uid, 'records', r.id), r).catch(err => {
                                 console.warn('Record upload warning:', err.message);
                             });
@@ -369,7 +362,6 @@
                     });
 
                     const mergedRecords = Array.from(recordMap.values()).sort((a, b) => b.timestamp - a.timestamp);
-
                     setRecords(mergedRecords);
                     localStorage.setItem('ff_records_morandi', JSON.stringify(mergedRecords));
                     setIsSyncing(false);
@@ -386,7 +378,6 @@
                 };
             }, [user]);
 
-            // Save Tasks changes to Firestore & LocalStorage
             const updateTasksWithSync = (newTasks) => {
                 setTasks(newTasks);
                 localStorage.setItem('ff_tasks_morandi', JSON.stringify(newTasks));
@@ -396,15 +387,12 @@
                         setDoc(doc(db, 'users', user.uid, 'tasks', t.id), t).catch(err => {
                             if (err.code === 'permission-denied' || err.message?.includes('permissions')) {
                                 setCloudSyncError(true);
-                            } else {
-                                console.warn('Firestore task write notice:', err);
                             }
                         });
                     });
                 }
             };
 
-            // Save Records changes to Firestore & LocalStorage
             const updateRecordsWithSync = (newRecord) => {
                 setRecords(prev => {
                     const updated = [newRecord, ...prev];
@@ -415,12 +403,9 @@
                 if (user && window.FirebaseServices && !cloudSyncError) {
                     const { db, doc, setDoc } = window.FirebaseServices;
                     setDoc(doc(db, 'users', user.uid, 'records', newRecord.id), newRecord)
-                        .then(() => console.log('Record synced to cloud'))
                         .catch(err => {
                             if (err.code === 'permission-denied' || err.message?.includes('permissions')) {
                                 setCloudSyncError(true);
-                            } else {
-                                console.warn('Cloud record write notice:', err);
                             }
                         });
                 }
@@ -502,7 +487,6 @@
                 return () => clearInterval(timer);
             }, [isRunning, timerType, mode, seconds]);
 
-            // Handle completed timer session or stopwatch pause & save
             const handleSessionComplete = () => {
                 setIsRunning(false);
                 playBeep('finish');
@@ -525,7 +509,6 @@
                     }
                 }
 
-                // FIXED ISSUE #3: When Stopwatch (正計時) finishes/pauses, reset elapsed time to zero
                 if (timerType === 'stopwatch') {
                     setElapsedStopwatch(0);
                 }
@@ -534,7 +517,6 @@
             const toggleTimer = () => {
                 playBeep('click');
                 if (isRunning && timerType === 'stopwatch') {
-                    // Clicking "暫停並儲存" in stopwatch mode triggers completion & reset
                     handleSessionComplete();
                 } else {
                     setIsRunning(!isRunning);
@@ -595,7 +577,7 @@
                     }}
                     class="flex-grow flex flex-col justify-between max-w-6xl mx-auto w-full px-3 sm:px-5 py-4 md:py-6 my-0 md:my-4 rounded-2xl md:rounded-3xl shadow-2xl border border-morandi-700/40 transition-all duration-200 overflow-x-hidden"
                 >
-                    {/* Header Bar - Fully Responsive for Mobile */}
+                    {/* Header Bar */}
                     <header class="flex flex-col md:flex-row justify-between items-center gap-3 mb-4 md:mb-6 border-b border-morandi-700/60 pb-3 md:pb-4 w-full">
                         <div class="flex items-center justify-between w-full md:w-auto">
                             <div class="flex items-center space-x-2.5">
@@ -605,7 +587,6 @@
                                 <span class="text-lg md:text-2xl font-bold tracking-wide text-[#B5BDB9]">FocusFlow</span>
                             </div>
 
-                            {/* Mobile user badge quick action */}
                             <button
                                 onClick={() => setIsAuthModalOpen(true)}
                                 class="md:hidden text-xs px-2.5 py-1.5 rounded-xl border border-morandi-600/80 bg-morandi-800/80 text-morandi-200 flex items-center space-x-1"
@@ -615,7 +596,6 @@
                             </button>
                         </div>
 
-                        {/* Navigation Tabs - Compact Responsive */}
                         <nav class="flex items-center justify-center w-full md:w-auto bg-morandi-900/80 p-1 md:p-1.5 rounded-2xl border border-morandi-700/60">
                             <button
                                 onClick={() => { playBeep('click'); setCurrentTab('timer'); }}
@@ -654,9 +634,7 @@
                             </button>
                         </nav>
 
-                        {/* Top Header Controls (Desktop & Mobile Wrapped) */}
                         <div class="flex items-center justify-end flex-wrap gap-1.5 md:gap-2 w-full md:w-auto">
-                            {/* User Auth Button */}
                             <button
                                 onClick={() => setIsAuthModalOpen(true)}
                                 class={`hidden md:flex px-3 py-2 rounded-xl text-xs font-semibold items-center space-x-1.5 border transition-all shadow-sm ${
@@ -675,7 +653,6 @@
                                 </span>
                             </button>
 
-                            {/* FIXED ISSUE #1: Transparency & Visual Controls Popover constrained on Mobile */}
                             <div class="relative shrink-0">
                                 <button
                                     onClick={() => setShowOpacitySlider(!showOpacitySlider)}
@@ -745,7 +722,6 @@
                                 )}
                             </div>
 
-                            {/* Background Upload Button */}
                             <label class="cursor-pointer bg-morandi-800/90 hover:bg-morandi-700 text-[#B5BDB9] border border-[#B5BDB9]/40 px-2.5 py-1.5 md:px-3 md:py-2 rounded-xl text-xs font-semibold flex items-center space-x-1 md:space-x-1.5 transition-all shadow-sm shrink-0">
                                 <i class="fa-solid fa-image"></i>
                                 <span>{bgImage ? '更換背景' : '自訂背景'}</span>
@@ -807,7 +783,7 @@
                         )}
                     </main>
 
-                    {/* Firebase Auth & User Modal */}
+                    {/* Firebase Auth Modal */}
                     {isAuthModalOpen && (
                         <AuthModal
                             user={user}
@@ -937,7 +913,6 @@
                             </button>
                         </div>
 
-                        {/* Error & Success Banners */}
                         {cloudSyncError && (
                             <div class="bg-amber-900/50 border border-amber-500/80 text-amber-200 text-xs p-3 rounded-xl flex items-center space-x-2">
                                 <i class="fa-solid fa-circle-info shrink-0 text-amber-300"></i>
@@ -958,7 +933,6 @@
                         )}
 
                         {user ? (
-                            /* Logged In Status Card */
                             <div class="space-y-4">
                                 <div class="bg-morandi-800/80 border border-morandi-700 p-4 rounded-2xl space-y-3">
                                     <div class="flex items-center justify-between">
@@ -989,13 +963,11 @@
                                 </button>
                             </div>
                         ) : (
-                            /* Login / Register Form */
                             <div class="space-y-4">
                                 <p class="text-xs text-morandi-200 leading-relaxed">
                                     登入後，您的專注紀錄與待辦清單將會在所有裝置（手機、電腦、平板）間自動保持同步。
                                 </p>
 
-                                {/* Google Auth Button */}
                                 <button
                                     onClick={handleGoogleLogin}
                                     disabled={isLoading}
@@ -1072,6 +1044,26 @@
             const [isPreviewOverlay, setIsPreviewOverlay] = React.useState(true);
             const imgRef = React.useRef(null);
 
+            // Detect initial device screen ratio (defaults to 9:16 for portrait mobile)
+            const isInitialPortrait = window.innerWidth < window.innerHeight;
+            const [aspectMode, setAspectMode] = React.useState(isInitialPortrait ? '9:16' : '16:9');
+
+            // Calculate canvas size and display aspect ratio dynamically
+            const getDimensions = React.useCallback(() => {
+                if (aspectMode === '9:16') {
+                    return { width: 720, height: 1280, ratioStr: '9/16' };
+                } else if (aspectMode === 'auto') {
+                    const w = window.innerWidth || 360;
+                    const h = window.innerHeight || 640;
+                    const targetW = 1080;
+                    const targetH = Math.round(1080 * (h / w));
+                    return { width: targetW, height: targetH, ratioStr: `${w}/${h}` };
+                } else {
+                    // '16:9'
+                    return { width: 1280, height: 720, ratioStr: '16/9' };
+                }
+            }, [aspectMode]);
+
             React.useEffect(() => {
                 const img = new Image();
                 img.crossOrigin = "anonymous";
@@ -1086,7 +1078,7 @@
                 if (imgRef.current) {
                     drawCanvas();
                 }
-            }, [zoom, pan]);
+            }, [zoom, pan, aspectMode, getDimensions]);
 
             const drawCanvas = () => {
                 const canvas = canvasRef.current;
@@ -1094,8 +1086,9 @@
                 const ctx = canvas.getContext('2d');
                 const img = imgRef.current;
 
-                canvas.width = 1280;
-                canvas.height = 720;
+                const { width: cWidth, height: cHeight } = getDimensions();
+                canvas.width = cWidth;
+                canvas.height = cHeight;
 
                 ctx.clearRect(0, 0, canvas.width, canvas.height);
 
@@ -1109,20 +1102,30 @@
                 ctx.drawImage(img, x, y, width, height);
             };
 
-            const handleMouseDown = (e) => {
-                setIsDragging(true);
-                setDragStart({ x: e.clientX - pan.x, y: e.clientY - pan.y });
+            // Touch and Mouse positions helper
+            const getPointerPos = (e) => {
+                if (e.touches && e.touches.length > 0) {
+                    return { x: e.touches[0].clientX, y: e.touches[0].clientY };
+                }
+                return { x: e.clientX, y: e.clientY };
             };
 
-            const handleMouseMove = (e) => {
+            const handleStart = (e) => {
+                setIsDragging(true);
+                const pos = getPointerPos(e);
+                setDragStart({ x: pos.x - pan.x, y: pos.y - pan.y });
+            };
+
+            const handleMove = (e) => {
                 if (!isDragging) return;
+                const pos = getPointerPos(e);
                 setPan({
-                    x: e.clientX - dragStart.x,
-                    y: e.clientY - dragStart.y
+                    x: pos.x - dragStart.x,
+                    y: pos.y - dragStart.y
                 });
             };
 
-            const handleMouseUp = () => {
+            const handleEnd = () => {
                 setIsDragging(false);
             };
 
@@ -1134,11 +1137,13 @@
                 }
             };
 
+            const { ratioStr } = getDimensions();
+
             return (
                 <div class="fixed inset-0 bg-black/80 backdrop-blur-md z-50 flex items-center justify-center p-3 sm:p-4 overflow-y-auto">
-                    <div class="bg-morandi-900 border border-morandi-600 w-full max-w-3xl rounded-2xl sm:rounded-3xl p-4 sm:p-6 shadow-2xl relative flex flex-col space-y-4 my-auto">
-                        <div class="flex justify-between items-center border-b border-morandi-700/80 pb-3">
-                            <h3 class="text-sm sm:text-base font-bold text-[#B5BDB9] flex items-center space-x-2">
+                    <div class="bg-morandi-900 border border-morandi-600 w-full max-w-3xl rounded-2xl sm:rounded-3xl p-4 sm:p-6 shadow-2xl relative flex flex-col space-y-3 sm:space-y-4 my-auto max-h-[96vh]">
+                        <div class="flex justify-between items-center border-b border-morandi-700/80 pb-2.5">
+                            <h3 class="text-xs sm:text-base font-bold text-[#B5BDB9] flex items-center space-x-2">
                                 <i class="fa-solid fa-crop text-[#B5BDB9]"></i>
                                 <span>背景圖片裁切與預覽</span>
                             </h3>
@@ -1147,15 +1152,53 @@
                             </button>
                         </div>
 
-                        {/* Interactive Canvas Viewport */}
-                        <div class="relative w-full overflow-hidden rounded-2xl border border-morandi-600 bg-black flex items-center justify-center select-none cursor-grab active:cursor-grabbing"
-                            onMouseDown={handleMouseDown}
-                            onMouseMove={handleMouseMove}
-                            onMouseUp={handleMouseUp}
-                            onMouseLeave={handleMouseUp}
-                            style={{ aspectRatio: '16/9' }}
+                        {/* Aspect Ratio Selector */}
+                        <div class="flex items-center justify-between bg-morandi-800/80 px-3 py-2 rounded-xl border border-morandi-700 text-xs">
+                            <span class="text-morandi-300 font-medium shrink-0">裁切比例：</span>
+                            <div class="flex items-center space-x-1 sm:space-x-2">
+                                <button
+                                    type="button"
+                                    onClick={() => { setAspectMode('9:16'); setPan({ x: 0, y: 0 }); }}
+                                    class={`px-2.5 py-1 rounded-lg font-semibold transition-all ${
+                                        aspectMode === '9:16' ? 'bg-[#B5BDB9] text-morandi-900' : 'text-morandi-300 hover:text-white bg-morandi-900/60'
+                                    }`}
+                                >
+                                    📱 手機直幅 (9:16)
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => { setAspectMode('16:9'); setPan({ x: 0, y: 0 }); }}
+                                    class={`px-2.5 py-1 rounded-lg font-semibold transition-all ${
+                                        aspectMode === '16:9' ? 'bg-[#B5BDB9] text-morandi-900' : 'text-morandi-300 hover:text-white bg-morandi-900/60'
+                                    }`}
+                                >
+                                    💻 電腦橫幅 (16:9)
+                                </button>
+                                <button
+                                    type="button"
+                                    onClick={() => { setAspectMode('auto'); setPan({ x: 0, y: 0 }); }}
+                                    class={`hidden sm:inline-block px-2.5 py-1 rounded-lg font-semibold transition-all ${
+                                        aspectMode === 'auto' ? 'bg-[#B5BDB9] text-morandi-900' : 'text-morandi-300 hover:text-white bg-morandi-900/60'
+                                    }`}
+                                >
+                                    📐 螢幕實體比例
+                                </button>
+                            </div>
+                        </div>
+
+                        {/* Interactive Canvas Viewport (Supports Mouse & Touch Dragging) */}
+                        <div 
+                            class="relative w-full overflow-hidden rounded-2xl border border-morandi-600 bg-black flex items-center justify-center select-none cursor-grab active:cursor-grabbing max-h-[50vh] sm:max-h-[55vh] mx-auto my-auto"
+                            onMouseDown={handleStart}
+                            onMouseMove={handleMove}
+                            onMouseUp={handleEnd}
+                            onMouseLeave={handleEnd}
+                            onTouchStart={handleStart}
+                            onTouchMove={handleMove}
+                            onTouchEnd={handleEnd}
+                            style={{ aspectRatio: ratioStr }}
                         >
-                            <canvas ref={canvasRef} class="w-full h-full object-contain"></canvas>
+                            <canvas ref={canvasRef} class="w-full h-full object-contain pointer-events-none"></canvas>
 
                             {isPreviewOverlay && (
                                 <div 
@@ -1164,26 +1207,26 @@
                                         backdropFilter: currentBlur > 0 ? `blur(${currentBlur}px)` : 'none',
                                         WebkitBackdropFilter: currentBlur > 0 ? `blur(${currentBlur}px)` : 'none'
                                     }}
-                                    class="absolute inset-3 sm:inset-4 rounded-2xl border border-[#B5BDB9]/40 p-3 sm:p-4 flex flex-col justify-between pointer-events-none transition-all"
+                                    class="absolute inset-2 sm:inset-4 rounded-2xl border border-[#B5BDB9]/40 p-3 sm:p-4 flex flex-col justify-between pointer-events-none transition-all"
                                 >
                                     <div class="flex justify-between items-center text-[10px] sm:text-xs text-[#B5BDB9] font-bold">
                                         <span>🍃 FocusFlow (預覽視窗)</span>
                                         <span class="bg-morandi-800/80 px-2 py-0.5 rounded-lg">透光: {Math.round(currentOpacity * 100)}% | 模糊: {currentBlur}px</span>
                                     </div>
-                                    <div class="text-center">
+                                    <div class="text-center my-auto py-2">
                                         <div class="text-2xl sm:text-4xl font-mono font-bold text-[#B5BDB9]">25:00</div>
                                     </div>
                                     <div class="text-center text-[10px] text-morandi-300">
-                                        拖拽圖片調整位置、使用下方拉桿縮放
+                                        單指/滑鼠拖拽圖片調整位置，下方拉桿縮放
                                     </div>
                                 </div>
                             )}
                         </div>
 
                         {/* Controls Bar */}
-                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-3 items-center bg-morandi-800/60 p-3 rounded-2xl border border-morandi-700/60">
+                        <div class="grid grid-cols-1 sm:grid-cols-2 gap-2.5 items-center bg-morandi-800/60 p-2.5 rounded-2xl border border-morandi-700/60">
                             {/* Zoom Slider */}
-                            <div class="flex items-center space-x-3">
+                            <div class="flex items-center space-x-2.5">
                                 <i class="fa-solid fa-magnifying-glass-minus text-xs text-morandi-300"></i>
                                 <input
                                     type="range"
@@ -1268,7 +1311,6 @@
 
             return (
                 <div class="flex flex-col items-center justify-center py-2 sm:py-4 w-full">
-                    {/* Top Mode Selector Tabs */}
                     <div class="flex flex-wrap justify-center gap-1.5 sm:gap-3 mb-6 bg-morandi-900/80 p-1.5 sm:p-2 rounded-full border border-morandi-700/50 max-w-full">
                         {modes.map(m => (
                             <div key={m.id} class="relative">
@@ -1293,7 +1335,6 @@
                         ))}
                     </div>
 
-                    {/* Pomodoro vs Stopwatch Mode Switch */}
                     <div class="flex items-center space-x-2 sm:space-x-3 mb-6 bg-morandi-900/60 px-3 py-1.5 rounded-xl border border-morandi-700/40 text-xs">
                         <span class="text-morandi-300">模式：</span>
                         <button
@@ -1316,22 +1357,18 @@
                         </button>
                     </div>
 
-                    {/* Timer Clock Card */}
                     <div class={`relative w-full max-w-lg bg-morandi-800/60 backdrop-blur-md rounded-2xl sm:rounded-3xl border border-morandi-600/60 p-6 sm:p-10 flex flex-col items-center shadow-2xl mb-6 transition-all ${
                         isRunning ? 'timer-running-pulse border-[#B5BDB9] bg-morandi-800/80' : ''
                     }`}>
-                        {/* Status Tag */}
                         <div class="absolute top-3 sm:top-4 right-4 sm:right-6 text-[11px] sm:text-xs text-morandi-200 flex items-center space-x-1.5">
                             <span class={`w-2 h-2 rounded-full ${isRunning ? 'bg-[#B5BDB9] animate-ping' : 'bg-morandi-400'}`}></span>
                             <span>{isRunning ? (timerType === 'pomodoro' ? '專注進行中...' : '正計時中...') : (timerType === 'pomodoro' ? '倒數模式' : '正計時模式')}</span>
                         </div>
 
-                        {/* Display Time */}
                         <div class="text-5xl sm:text-7xl md:text-8xl font-mono font-bold tracking-tight text-[#B5BDB9] my-4 sm:my-6 drop-shadow-md select-none">
                             {timerType === 'pomodoro' ? formatDisplayTime(seconds) : formatDisplayTime(elapsedStopwatch)}
                         </div>
 
-                        {/* Selected Task Dropdown */}
                         <div class="w-full max-w-xs sm:max-w-sm mt-2">
                             <div class="flex items-center justify-between border-b border-[#B5BDB9]/40 pb-1.5 px-2">
                                 <div class="flex items-center space-x-2 text-morandi-200 text-xs sm:text-sm flex-grow">
@@ -1365,7 +1402,6 @@
                             </div>
                         </div>
 
-                        {/* FIXED ISSUE #3: Control Buttons with explicit "暫停並儲存" (Pause & Save & Reset to 0) for Stopwatch */}
                         <div class="mt-8 sm:mt-10 flex items-center space-x-3 sm:space-x-4">
                             <button
                                 onClick={toggleTimer}
@@ -1555,7 +1591,6 @@
 
             return (
                 <div class="space-y-4 sm:space-y-6 py-2 w-full">
-                    {/* Header Controls */}
                     <div class="flex flex-col sm:flex-row justify-between items-center gap-3 bg-morandi-800/60 p-3.5 rounded-2xl border border-morandi-700/60">
                         <div class="flex items-center space-x-2">
                             <span class="text-[#B5BDB9] font-bold text-base sm:text-lg">📊 專注統計分析儀表板</span>
@@ -1583,7 +1618,6 @@
                         </div>
                     </div>
 
-                    {/* Activity Status Grid */}
                     <div>
                         <h3 class="text-xs sm:text-sm font-semibold text-morandi-200 mb-2.5 flex items-center space-x-2">
                             <i class="fa-solid fa-seedling text-[#B5BDB9]"></i>
@@ -1632,7 +1666,6 @@
                         </div>
                     </div>
 
-                    {/* Chart & Ranking Section */}
                     <div class="grid grid-cols-1 lg:grid-cols-3 gap-4">
                         <div class="lg:col-span-2 bg-morandi-800/60 border border-morandi-700/60 p-4 sm:p-5 rounded-2xl flex flex-col justify-between">
                             <div class="flex justify-between items-center mb-3">
@@ -1710,7 +1743,6 @@
 
             return (
                 <div class="max-w-3xl mx-auto w-full py-2 sm:py-4 space-y-4 sm:space-y-6">
-                    {/* Add New Task Card */}
                     <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 sm:p-6 rounded-2xl shadow-lg">
                         <h3 class="text-sm sm:text-base font-bold text-[#B5BDB9] mb-3 sm:mb-4 flex items-center space-x-2">
                             <i class="fa-solid fa-plus text-[#B5BDB9]"></i>
@@ -1728,7 +1760,6 @@
                                 />
                             </div>
                             
-                            {/* Morandi Color Palette Picker */}
                             <div>
                                 <label class="block text-xs text-morandi-300 mb-2">選擇類別色彩 (莫蘭迪色系)</label>
                                 <div class="flex flex-wrap gap-2">
@@ -1760,7 +1791,6 @@
                         </form>
                     </div>
 
-                    {/* Existing Task List Card */}
                     <div class="bg-morandi-800/60 border border-morandi-700/60 p-4 sm:p-6 rounded-2xl shadow-lg">
                         <div class="flex items-center justify-between mb-3 sm:mb-4">
                             <h3 class="text-sm sm:text-base font-bold text-[#B5BDB9]">現有待辦清單</h3>
