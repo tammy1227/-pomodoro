@@ -45,7 +45,9 @@
         } from "https://www.gstatic.com/firebasejs/11.6.1/firebase-firestore.js";
 
         // Global Firebase Environment & Config
-        const appId = typeof __app_id !== 'undefined' ? __app_id : 'focus-flow-app';
+        // 固定 App ID，確保不同裝置永遠使用同一個 Firestore 路徑
+        // 不使用可能因執行環境不同而改變的 __app_id。
+        const appId = 'focus-flow-app';
         const firebaseConfig = typeof __firebase_config !== 'undefined'
             ? JSON.parse(__firebase_config)
             : {
@@ -118,6 +120,12 @@
         }
     </script>
     <style>
+        html, body {
+            width: 100%;
+            max-width: 100%;
+            overflow-x: hidden;
+        }
+
         body {
             font-family: 'Zen Maru Gothic', sans-serif;
             background-color: #182420;
@@ -236,6 +244,7 @@
             const [user, setUser] = React.useState(null);
             const [isAuthModalOpen, setIsAuthModalOpen] = React.useState(false);
             const [authNotice, setAuthNotice] = React.useState('');
+            const [syncError, setSyncError] = React.useState('');
 
             // Timer States
             const [mode, setMode] = React.useState('focus');
@@ -300,57 +309,108 @@
             // Firestore Synchronization for User Data
             React.useEffect(() => {
                 if (!user || !window.FirebaseServices) return;
+
                 const { db, appId, collection, onSnapshot, doc, setDoc } = window.FirebaseServices;
+                let cancelled = false;
+                setSyncError('');
 
-                // Sync Tasks Path: /artifacts/{appId}/users/{userId}/tasks
-                const tasksColRef = collection(db, 'artifacts', appId, 'users', user.uid, 'tasks');
-                const unsubscribeTasks = onSnapshot(tasksColRef, (snapshot) => {
-                    if (!snapshot.empty) {
-                        const fetchedTasks = [];
-                        snapshot.forEach(doc => fetchedTasks.push({ id: doc.id, ...doc.data() }));
-                        setTasks(fetchedTasks);
-                        localStorage.setItem('ff_tasks_morandi', JSON.stringify(fetchedTasks));
-                    } else {
-                        // First time sync default tasks
-                        tasks.forEach(t => {
-                            setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'tasks', t.id), t);
-                        });
-                    }
-                }, (error) => {
-                    console.error("Firestore tasks sync error:", error);
-                });
+                // 所有裝置都使用同一個固定路徑：
+                // /artifacts/focus-flow-app/users/{Google UID}/...
+                const userRoot = ['artifacts', appId, 'users', user.uid];
 
-                // Sync Records Path: /artifacts/{appId}/users/{userId}/records
-                const recordsColRef = collection(db, 'artifacts', appId, 'users', user.uid, 'records');
-                const unsubscribeRecords = onSnapshot(recordsColRef, (snapshot) => {
-                    const fetchedRecords = [];
-                    snapshot.forEach(doc => fetchedRecords.push({ id: doc.id, ...doc.data() }));
+                const tasksColRef = collection(db, ...userRoot, 'tasks');
+                const recordsColRef = collection(db, ...userRoot, 'records');
 
-                    // Read local records
-                    const localRecords = JSON.parse(localStorage.getItem('ff_records_morandi') || '[]');
-                    
-                    // Merge local and cloud records (deduplicate by record ID)
-                    const recordMap = new Map();
-                    localRecords.forEach(r => recordMap.set(r.id, r));
-                    fetchedRecords.forEach(r => recordMap.set(r.id, r));
+                // Tasks 同步
+                const unsubscribeTasks = onSnapshot(
+                    tasksColRef,
+                    async (snapshot) => {
+                        if (cancelled) return;
 
-                    const mergedRecords = Array.from(recordMap.values());
+                        if (!snapshot.empty) {
+                            const fetchedTasks = [];
+                            snapshot.forEach(taskDoc => {
+                                fetchedTasks.push({ id: taskDoc.id, ...taskDoc.data() });
+                            });
+                            setTasks(fetchedTasks);
+                            localStorage.setItem('ff_tasks_morandi', JSON.stringify(fetchedTasks));
+                        } else {
+                            // 雲端第一次使用：把目前裝置的任務上傳一次
+                            const localTasks = JSON.parse(
+                                localStorage.getItem('ff_tasks_morandi') || 'null'
+                            ) || DEFAULT_TASKS;
 
-                    // Auto-upload local records that are not yet in Firestore
-                    localRecords.forEach(r => {
-                        if (!fetchedRecords.some(fr => fr.id === r.id)) {
-                            setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'records', r.id), r)
-                                .catch(err => console.error("Error uploading local record to Firestore:", err));
+                            await Promise.all(
+                                localTasks.map(t =>
+                                    setDoc(doc(db, ...userRoot, 'tasks', t.id), t)
+                                )
+                            ).catch(err => {
+                                console.error('Error uploading initial tasks:', err);
+                                setSyncError('雲端任務同步失敗，請檢查 Firestore 權限');
+                            });
                         }
-                    });
+                    },
+                    (error) => {
+                        console.error('Firestore tasks sync error:', error);
+                        setSyncError('Firestore 無法讀取資料：' + (error.code || error.message));
+                    }
+                );
 
-                    setRecords(mergedRecords);
-                    localStorage.setItem('ff_records_morandi', JSON.stringify(mergedRecords));
-                }, (error) => {
-                    console.error("Firestore records sync error:", error);
-                });
+                // Records 同步
+                const unsubscribeRecords = onSnapshot(
+                    recordsColRef,
+                    async (snapshot) => {
+                        if (cancelled) return;
+
+                        const cloudRecords = [];
+                        snapshot.forEach(recordDoc => {
+                            cloudRecords.push({ id: recordDoc.id, ...recordDoc.data() });
+                        });
+
+                        const localRecords = JSON.parse(
+                            localStorage.getItem('ff_records_morandi') || '[]'
+                        );
+
+                        // 雲端資料 + 本機尚未上傳的資料合併
+                        const recordMap = new Map();
+                        cloudRecords.forEach(r => recordMap.set(String(r.id), r));
+                        localRecords.forEach(r => {
+                            if (!recordMap.has(String(r.id))) {
+                                recordMap.set(String(r.id), r);
+                            }
+                        });
+
+                        const mergedRecords = Array.from(recordMap.values());
+
+                        // 把本機沒有出現在雲端的舊紀錄補上傳
+                        const cloudIds = new Set(cloudRecords.map(r => String(r.id)));
+                        const pendingUploads = localRecords
+                            .filter(r => !cloudIds.has(String(r.id)))
+                            .map(r =>
+                                setDoc(doc(db, ...userRoot, 'records', String(r.id)), r)
+                            );
+
+                        try {
+                            await Promise.all(pendingUploads);
+                        } catch (err) {
+                            console.error('Error uploading local records:', err);
+                            setSyncError('部分本機紀錄尚未成功上傳雲端');
+                        }
+
+                        setRecords(mergedRecords);
+                        localStorage.setItem(
+                            'ff_records_morandi',
+                            JSON.stringify(mergedRecords)
+                        );
+                    },
+                    (error) => {
+                        console.error('Firestore records sync error:', error);
+                        setSyncError('Firestore 無法讀取專注紀錄：' + (error.code || error.message));
+                    }
+                );
 
                 return () => {
+                    cancelled = true;
                     unsubscribeTasks();
                     unsubscribeRecords();
                 };
@@ -378,7 +438,13 @@
 
                 if (user && window.FirebaseServices) {
                     const { db, appId, doc, setDoc } = window.FirebaseServices;
-                    setDoc(doc(db, 'artifacts', appId, 'users', user.uid, 'records', newRecord.id), newRecord).catch(err => console.error(err));
+                    setDoc(
+                        doc(db, 'artifacts', appId, 'users', user.uid, 'records', String(newRecord.id)),
+                        newRecord
+                    ).catch(err => {
+                        console.error('Error saving record to Firestore:', err);
+                        setSyncError('這筆紀錄尚未成功同步到雲端：' + (err.code || err.message));
+                    });
                 }
             };
 
@@ -543,10 +609,10 @@
                         backdropFilter: bgBlur > 0 ? `blur(${bgBlur}px)` : 'none',
                         WebkitBackdropFilter: bgBlur > 0 ? `blur(${bgBlur}px)` : 'none'
                     }}
-                    class="flex-grow flex flex-col justify-between max-w-6xl mx-auto w-full px-4 py-4 md:py-6 my-0 md:my-4 rounded-3xl shadow-2xl border border-morandi-700/40 transition-all duration-200"
+                    class="flex-grow flex flex-col justify-between max-w-6xl mx-auto w-full min-w-0 px-3 sm:px-4 py-4 md:py-6 my-0 md:my-4 rounded-3xl shadow-2xl border border-morandi-700/40 transition-all duration-200"
                 >
                     {/* Header Bar */}
-                    <header class="flex flex-wrap justify-between items-center gap-4 mb-6 border-b border-morandi-700/60 pb-4">
+                    <header class="flex flex-wrap justify-between items-center gap-3 mb-6 border-b border-morandi-700/60 pb-4 min-w-0">
                         <div class="flex items-center space-x-3">
                             <div class="w-10 h-10 rounded-2xl bg-[#B5BDB9] flex items-center justify-center text-morandi-900 font-bold text-xl shadow-lg">
                                 <i class="fa-solid fa-leaf"></i>
@@ -555,7 +621,7 @@
                         </div>
 
                         {/* Top Nav Tabs */}
-                        <nav class="flex items-center bg-morandi-900/80 p-1.5 rounded-2xl border border-morandi-700/60">
+                        <nav class="flex items-center max-w-full overflow-x-auto bg-morandi-900/80 p-1.5 rounded-2xl border border-morandi-700/60">
                             <button
                                 onClick={() => { playBeep('click'); setCurrentTab('timer'); }}
                                 class={`flex items-center space-x-2 px-4 py-2 rounded-xl text-sm md:text-base font-medium transition-all ${
@@ -595,7 +661,7 @@
 
                         {}
                         {/* Header Actions: Auth Login & Visual Controls */}
-                        <div class="flex items-center space-x-2">
+                        <div class="flex flex-wrap items-center justify-end gap-2 max-w-full">
                             {/* User Auth Button */}
                             <button
                                 onClick={() => setIsAuthModalOpen(true)}
@@ -621,7 +687,7 @@
                                 </button>
 
                                 {showOpacitySlider && (
-                                    <div class="absolute top-12 right-0 bg-morandi-900 border border-morandi-600 p-4 rounded-2xl shadow-2xl z-30 w-60 flex flex-col space-y-4">
+                                    <div class="absolute top-12 right-0 bg-morandi-900 border border-morandi-600 p-4 rounded-2xl shadow-2xl z-30 w-60 max-w-[calc(100vw-2rem)] flex flex-col space-y-4">
                                         <div class="flex flex-col space-y-1">
                                             <div class="flex justify-between text-xs text-morandi-200 font-medium">
                                                 <span>不透明度</span>
@@ -701,6 +767,12 @@
 
                     {/* Main Content Area */}
                     <main class="flex-grow flex flex-col justify-center">
+                        {syncError && (
+                            <div class="mb-4 mx-auto w-full max-w-3xl bg-rose-900/60 border border-rose-500/70 text-rose-200 text-xs p-3 rounded-xl break-words">
+                                <i class="fa-solid fa-triangle-exclamation mr-2"></i>
+                                {syncError}
+                            </div>
+                        )}
                         {currentTab === 'timer' && (
                             <TimerView
                                 mode={mode}
@@ -1257,7 +1329,7 @@
                     </div>
 
                     {/* Timer Clock Card */}
-                    <div class={`relative w-full max-w-lg bg-morandi-800/60 backdrop-blur-md rounded-3xl border border-morandi-600/60 p-8 md:p-12 flex flex-col items-center shadow-2xl mb-8 transition-all ${
+                    <div class={`relative w-full max-w-lg min-w-0 bg-morandi-800/60 backdrop-blur-md rounded-3xl border border-morandi-600/60 p-5 sm:p-8 md:p-12 flex flex-col items-center shadow-2xl mb-8 transition-all ${
                         isRunning ? 'timer-running-pulse border-[#B5BDB9] bg-morandi-800/80' : ''
                     }`}>
                         {/* Status Tag */}
@@ -1267,7 +1339,7 @@
                         </div>
 
                         {/* Display Time */}
-                        <div class="text-6xl md:text-8xl font-mono font-bold tracking-tight text-[#B5BDB9] my-4 drop-shadow-md select-none">
+                        <div class="text-5xl sm:text-6xl md:text-8xl font-mono font-bold tracking-tight text-[#B5BDB9] my-4 drop-shadow-md select-none">
                             {timerType === 'pomodoro' ? formatDisplayTime(seconds) : formatDisplayTime(elapsedStopwatch)}
                         </div>
 
